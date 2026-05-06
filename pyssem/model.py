@@ -367,7 +367,9 @@ if __name__ == "__main__":
     # with open(os.path.join('pyssem', 'simulation_configurations', 'opus_new.json')) as f:
     # with open(os.path.join('pyssem', 'simulation_configurations', 'three_species.json')) as f:
     # with open(os.path.join('pyssem', 'simulation_configurations', 'elliptical-test.json')) as f:
-    with open(os.path.join('pyssem', 'simulation_configurations', 'mocat-mc.json')) as f:
+    # with open(os.path.join('pyssem', 'simulation_configurations', 'mocat-mc.json')) as f:
+    with open(os.path.join('pyssem', 'simulation_configurations', 'workshop.json')) as f:
+    # with open(os.path.join('pyssem', 'simulation_configurations', 'three_species.json')) as f:
         simulation_data = json.load(f)
 
     scenario_props = simulation_data["scenario_properties"]

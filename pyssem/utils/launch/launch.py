@@ -320,6 +320,289 @@ def assign_species_to_population(T, species_mapping):
 
     return T
 
+def workshop_traffic_model(scen_properties, file_path):
+    """
+    Adapted traffic model for the Workshop CSV format.
+    Handles units (meters to km) and maps specific workshop headers to SSEM logic.
+
+    Columns found in file: ['object type', 'sma [m]', 'ecc [-]', 'inc [deg]', 'area [m^2]', 'mass [kg]', 
+    'status [-]', 'RAAN [deg]', 'AoP [deg]', 'M [deg]', 'date [-]', 'MJD [-]', 'species_class']
+    """
+
+    # Calculate Apogee, Perigee, and altitude
+    T = pd.read_csv(file_path)
+
+    # New CSV -> Internal name
+    column_mapping = {
+        'sma [m]': 'sma_m',
+        'ecc [-]': 'ecc',
+        'mass [kg]': 'mass',
+        'area [m^2]': 'area',
+        'date [-]': 'epoch_start_datetime'
+    }
+
+    # Check if necessary columns exist
+    for col in column_mapping.keys():
+        if col not in T.columns:
+            raise KeyError(f"Required column '{col}' missing from CSV. Found: {T.columns.tolist()}")
+
+    # Rename for easier access
+    T = T.rename(columns=column_mapping)
+
+    # 3. Convert Units (Meters to Kilometers for SMA)
+    T['sma'] = T['sma_m'] / 1000.0
+    
+
+    T['apogee'] = T['sma'] * (1 + T['ecc'])
+    T['perigee'] = T['sma'] * (1 - T['ecc'])
+    T['alt'] = (T['apogee'] + T['perigee']) / 2 - scen_properties.re
+
+    # Filter Rows Based on Min and Max_Altitude
+    # T = T[(T['alt'] >= scen_properties.min_altitude) & (T['alt'] <= scen_properties.max_altitude)] 
+    # Filter based on perigee height
+    T['hp'] = T['sma']*(1 - T['ecc']) - scen_properties.re
+    T = T[(T['hp'] >= scen_properties.min_altitude) & (T['hp'] <= scen_properties.max_altitude)]
+
+    # =======================================
+    # ASK INDIGO
+    # change all species_class from 'Su' to 'S'
+    T['species_class'] = T['species_class'].replace('Su', 'S')
+    # =======================================
+    
+    T_new = T
+
+    # =======================================
+    # ASK INDIGO
+    # # convert D to N
+    T_new['species_class'] = T_new['species_class'].replace('D', 'N')
+    # =======================================
+
+    # Create a list to store processed dataframes
+    processed_dfs = []
+
+    for species_class in T_new['species_class'].unique():
+        if species_class in scen_properties.species_cells:
+            T_obj_class = T_new[T_new['species_class'] == species_class].copy()
+            
+            if len(scen_properties.species_cells[species_class]) == 1:
+                T_obj_class['species'] = scen_properties.species_cells[species_class][0].sym_name
+            else:
+                species_cells = scen_properties.species_cells[species_class]
+                # find_mass_bin is a helper function assumed to be in your namespace
+                T_obj_class['species'] = T_obj_class['mass'].apply(find_mass_bin, args=(scen_properties, species_cells)) 
+            
+            processed_dfs.append(T_obj_class)
+        elif species_class == 'D':
+            # Handle Derelicts not explicitly in cells
+            T_obj_class = T_new[T_new['species_class'] == species_class].copy()
+            T_obj_class['species'] = 'N_521.8210518282503kg' # Default debris fallback
+            processed_dfs.append(T_obj_class)
+        
+    # Concatenate all processed dataframes
+    if processed_dfs:
+        T_new = pd.concat(processed_dfs, ignore_index=True)
+
+    print(f"Number of objects for each species in T_new: {T_new['species'].value_counts()}")
+
+
+    T_new['epoch_start_datetime'] = pd.to_datetime(T_new['epoch_start_datetime'], errors='coerce')
+    T_new['year_start'] = T_new['epoch_start_datetime'].dt.year
+
+    T_new['alt_bin'] = T_new['alt'].apply(find_alt_bin, args=(scen_properties,))
+
+    # Filter T_new to include only species present in scen_properties
+    T_new = T_new[T_new['species'].isin(scen_properties.species_names)]
+
+    # Initial population
+    # Include objects where epoch_start_datetime <= start_date OR is NaT (missing dates)
+    # Missing dates typically indicate debris/fragments that should be in initial population
+    x0 = T_new[(T_new['epoch_start_datetime'] <= scen_properties.start_date) | 
+               (T_new['epoch_start_datetime'].isna())]
+
+    # x0['species'].value_counts().plot(kind='bar', figsize=(12, 6))
+
+    x0.to_csv(os.path.join('pyssem', 'utils', 'launch', 'data', 'x0.csv'))
+
+    if scen_properties.elliptical:
+        # === 3D case: [alt_bin, species_idx, ecc_bin] ===
+        # Bin eccentricity
+        ecc_edges = np.array(scen_properties.eccentricity_bins)
+        x0['ecc_bin'] = pd.cut(x0['ecc'], bins=ecc_edges, labels=False, include_lowest=True)
+
+        # Also do it to do T_new for launch
+        T_new['ecc_bin'] = pd.cut(T_new['ecc'], bins=ecc_edges, labels=False, include_lowest=True)
+
+        # Create empty 3D summary array
+        n_shells = scen_properties.n_shells
+        n_species = len(scen_properties.species_names)
+        n_ecc_bins = len(ecc_edges) - 1
+
+        x0_summary = np.zeros((n_shells, n_species, n_ecc_bins), dtype=int)
+
+        # Map species name → index
+        species_name_to_index = {name: idx for idx, name in enumerate(scen_properties.species_names)}
+
+        # Fill in the summary
+        for _, row in x0.iterrows():
+            alt_bin = row['alt_bin']
+            species_idx = species_name_to_index.get(row['species'], None)
+            ecc_bin = row['ecc_bin']
+
+            # Check all indices are valid before indexing
+            if (pd.notna(alt_bin) and pd.notna(ecc_bin) and 
+                species_idx is not None and 
+                0 <= int(alt_bin) < n_shells and 
+                0 <= int(ecc_bin) < n_ecc_bins):
+                x0_summary[int(alt_bin), species_idx, int(ecc_bin)] += 1
+
+    else:
+        # === Standard 2D case: DataFrame [alt_bin, species] ===
+        df = x0.pivot_table(index='alt_bin', columns='species', aggfunc='size', fill_value=0)
+        x0_summary = pd.DataFrame(index=range(scen_properties.n_shells), columns=scen_properties.species_names).fillna(0)
+        # x0_summary.update(df.reindex(columns=x0_summary.columns, fill_value=0))
+        # Replace the problematic line with:
+        df_pivot = df.reindex(columns=x0_summary.columns, fill_value=0)
+
+        # Check for and handle duplicate columns
+        if df_pivot.columns.duplicated().any():
+            # Sum duplicate columns
+            df_pivot = df_pivot.groupby(df_pivot.columns, axis=1).sum()
+
+        # Then update
+        x0_summary.update(df_pivot)
+
+    if scen_properties.baseline:
+        return x0_summary, None
+    
+    # Future Launch Model (updated)
+    flm_steps = pd.DataFrame()
+
+    time_increment_per_step = scen_properties.simulation_duration / scen_properties.steps
+
+    time_steps = [
+        scen_properties.start_date + timedelta(days=365.25 * time_increment_per_step * i) 
+        for i in range(scen_properties.steps + 1)
+    ]    
+
+    # Distribute the Yearly Launches, USED FOR STEP FUNCTION, but also works w/ current and old interp
+    start_year = scen_properties.start_date.year
+    end_year = start_year + scen_properties.simulation_duration
+
+    for year in tqdm(range(start_year, end_year), desc="Processing Launch Years"):
+        
+        launches_this_year = T_new[T_new['year_start'] == year]
+        
+        if launches_this_year.empty:
+            continue
+
+        # Group by shell and species to get total counts for the entire year
+        # yearly_counts = launches_this_year.groupby(['alt_bin', 'species']).size().unstack(fill_value=0)
+        if scen_properties.elliptical:
+            yearly_counts = launches_this_year.groupby(['alt_bin', 'ecc_bin', 'species']).size()
+            yearly_counts = yearly_counts.unstack(fill_value=0)
+
+            all_alt_ecc_bins = pd.MultiIndex.from_product(
+                [range(scen_properties.n_shells), range(len(ecc_edges) - 1)],
+                names=['alt_bin', 'ecc_bin']
+            )
+            yearly_counts = yearly_counts.reindex(all_alt_ecc_bins, fill_value=0)
+
+        else:
+            yearly_counts = launches_this_year.groupby(['alt_bin', 'species']).size().unstack(fill_value=0)
+            yearly_counts = yearly_counts.reindex(range(scen_properties.n_shells), fill_value=0)
+
+        # Find which simulation time steps fall within this calendar year
+        year_start_date = datetime(year, 1, 1)
+        year_end_date = datetime(year + 1, 1, 1)
+        
+        relevant_steps_mask = (np.array(time_steps[:-1]) >= year_start_date) & (np.array(time_steps[:-1]) < year_end_date)
+        relevant_start_times = np.array(time_steps[:-1])[relevant_steps_mask]
+
+        if len(relevant_start_times) == 0:
+            continue
+
+        # Use only the first time step in the year (mimicking MC behavior)
+        step_counts = yearly_counts.copy()
+        step_counts = step_counts.reset_index()
+        step_counts['epoch_start_date'] = relevant_start_times[0]
+
+        flm_steps = pd.concat([flm_steps, step_counts], ignore_index=True)
+
+    # Final re-ordering and cleanup
+    # Ensure all species columns from the scenario are present, even if they had no launches
+    all_species_columns = scen_properties.species_names
+    for col in all_species_columns:
+        if col not in flm_steps.columns:
+            flm_steps[col] = 0
+
+    # Ensure consistent column order
+    if scen_properties.elliptical:
+        final_cols = ['epoch_start_date', 'alt_bin', 'ecc_bin'] + all_species_columns
+    else:
+        final_cols = ['epoch_start_date', 'alt_bin'] + all_species_columns
+
+    flm_steps = flm_steps[final_cols]
+
+    # Validation check for elliptical case
+    if scen_properties.elliptical:
+        # Reconstruct variables needed for validation
+        ecc_edges = np.array(scen_properties.eccentricity_bins)
+        n_shells = scen_properties.n_shells
+        n_ecc_bins = len(ecc_edges) - 1
+        species_name_to_index = {name: idx for idx, name in enumerate(scen_properties.species_names)}
+        
+        # Count total objects in the 3D matrix
+        total_in_matrix = np.sum(x0_summary)
+        
+        # Count valid objects in x0 that should have been added
+        valid_mask = (
+            x0['alt_bin'].notna() & 
+            x0['ecc_bin'].notna() & 
+            x0['species'].isin(scen_properties.species_names) &
+            (x0['alt_bin'] >= 0) & (x0['alt_bin'] < n_shells) &
+            (x0['ecc_bin'] >= 0) & (x0['ecc_bin'] < n_ecc_bins)
+        )
+        total_valid_objects = valid_mask.sum()
+        
+        # Count objects that were filtered out (invalid indices)
+        invalid_objects = (~valid_mask).sum()
+        
+        # Verify counts match
+        if total_in_matrix != total_valid_objects:
+            raise ValueError(
+                f"Mismatch in elliptical 3D matrix population!\n"
+                f"  Total objects in x0_summary matrix: {total_in_matrix}\n"
+                f"  Total valid objects in x0: {total_valid_objects}\n"
+                f"  Objects with invalid indices (not added): {invalid_objects}\n"
+                f"  Difference: {abs(total_in_matrix - total_valid_objects)}"
+            )
+        
+        # Additional verification: cross-check a sample of objects are in correct bins
+        # Verify by reconstructing counts from x0 and comparing
+        verification_counts = x0[valid_mask].groupby(['alt_bin', 'species', 'ecc_bin']).size()
+        
+        mismatches = []
+        for (alt_bin, species, ecc_bin), count in verification_counts.items():
+            species_idx = species_name_to_index.get(species, None)
+            if species_idx is not None:
+                matrix_count = x0_summary[int(alt_bin), species_idx, int(ecc_bin)]
+                if matrix_count != count:
+                    mismatches.append(
+                        f"  Bin [{int(alt_bin)}, {species}, {int(ecc_bin)}]: "
+                        f"expected {count}, found {matrix_count}"
+                    )
+        
+        if mismatches:
+            raise ValueError(
+                f"Found {len(mismatches)} bin mismatches in elliptical 3D matrix:\n" +
+                "\n".join(mismatches[:10]) +  # Show first 10 mismatches
+                (f"\n  ... and {len(mismatches) - 10} more" if len(mismatches) > 10 else "")
+            )
+        
+        print(f"✓ Elliptical 3D matrix validation passed: {total_in_matrix} objects correctly placed")
+
+    return x0_summary, flm_steps
+
 def SEP_traffic_model(scen_properties, file_path):
     """
     This will take one of the SEP files, users must select on of the Space Environment Pathways (SEPs), see: https://www.researchgate.net/publication/385299836_Development_of_Reference_Scenarios_and_Supporting_Inputs_for_Space_Environment_Modeling

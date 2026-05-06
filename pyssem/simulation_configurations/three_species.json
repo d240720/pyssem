@@ -21,11 +21,10 @@
     "parallel_processing": false,
     "baseline" : false,
     "launch_scenario": "SEP2",
-    "indicator_variables": ["umpy"]           
+    "indicator_variables": []           
   },
   "plots": [
-    "total_objects_over_time",
-    "indicator_variables"
+    "all_plots"
   ],
   "SEP_mapping": [
       "T.loc[(T['obj_type'] == 2) &  (T['obj_type'] == 2) & (T['maneuverable'] == 1), 'species_class'] = 'Su'",
