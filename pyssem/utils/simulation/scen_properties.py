@@ -6,7 +6,7 @@ from scipy.interpolate import interp1d, make_interp_spline
 from tqdm import tqdm
 import sympy as sp
 from ..drag.drag import *
-from ..launch.launch import ADEPT_traffic_model, SEP_traffic_model
+from ..launch.launch import ADEPT_traffic_model, SEP_traffic_model, workshop_traffic_model
 from ..handlers.handlers import download_file_from_google_drive
 from ..simulation.build_run_model_helpers import *
 from ..indicators.indicators import *
@@ -584,6 +584,12 @@ class ScenarioProperties:
 
         if launch_file == 'adept':
             launch_file_path = os.path.join('pyssem', 'utils', 'launch', 'data', 'x0_launch_repeatlaunch_2018to2022_megaconstellationLaunches_Constellations.csv')
+        elif launch_file == 'workshop_nfl':
+            # launch_file_path = os.path.join('pyssem', 'utils', 'launch', 'data', 'ex1_intact_objs_nfl_w_debris_new.csv')
+            launch_file_path = os.path.join('pyssem', 'utils', 'launch', 'data', 'ex1_intact_objs_nfl_w_debris_new_v2_2025_N.csv')
+        elif launch_file == 'workshop_baseline':
+            # launch_file_path = os.path.join('pyssem', 'utils', 'launch', 'data', 'ex1_intact_objs_baseline_w_debris_new.csv')
+            launch_file_path = os.path.join('pyssem', 'utils', 'launch', 'data', 'ex1_intact_objs_baseline_w_debris_new_v2_2025_N.csv')
         else:
             launch_file_path = os.path.join('pyssem', 'utils', 'launch', 'data',f'ref_scen_{launch_file}.csv')
         
@@ -615,6 +621,8 @@ class ScenarioProperties:
                 print("Filepath:", filepath)
                     
                 [x0, FLM_steps] = ADEPT_traffic_model(self, filepath)
+            elif launch_file == 'workshop_nfl' or launch_file == 'workshop_baseline':
+                [x0, FLM_steps] = workshop_traffic_model(self, launch_file_path)
             else:
                 [x0, FLM_steps] = SEP_traffic_model(self, launch_file_path)
         else:

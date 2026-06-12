@@ -320,6 +320,316 @@ def assign_species_to_population(T, species_mapping):
 
     return T
 
+def workshop_traffic_model(scen_properties, file_path):
+    """
+    Adapted traffic model for the Workshop CSV format.
+    Handles units (meters to km) and maps specific workshop headers to SSEM logic.
+
+    Columns found in file: ['object type', 'sma [m]', 'ecc [-]', 'inc [deg]', 'area [m^2]', 'mass [kg]', 
+    'status [-]', 'RAAN [deg]', 'AoP [deg]', 'M [deg]', 'date [-]', 'MJD [-]', 'species_class']
+    """
+
+    # Calculate Apogee, Perigee, and altitude
+    T = pd.read_csv(file_path)
+
+    # New CSV -> Internal name
+    column_mapping = {
+        'sma [m]': 'sma_m',
+        'ecc [-]': 'ecc',
+        'mass [kg]': 'mass',
+        'area [m^2]': 'area',
+        'date [-]': 'epoch_start_datetime'
+    }
+
+    # Check if necessary columns exist
+    for col in column_mapping.keys():
+        if col not in T.columns:
+            raise KeyError(f"Required column '{col}' missing from CSV. Found: {T.columns.tolist()}")
+
+    # Rename for easier access
+    T = T.rename(columns=column_mapping)
+
+    # 3. Convert Units (Meters to Kilometers for SMA)
+    T['sma'] = T['sma_m'] / 1000.0
+
+
+    if 'OPUS' not in file_path:
+        T['apogee'] = T['sma'] * (1 + T['ecc'])
+        T['perigee'] = T['sma'] * (1 - T['ecc'])
+        T['alt'] = (T['apogee'] + T['perigee']) / 2 - scen_properties.re
+    
+        # Filter Rows Based on Min and Max_Altitude
+        T = T[(T['alt'] >= scen_properties.min_altitude) & (T['alt'] <= scen_properties.max_altitude)] 
+
+        # T_new = assign_species_to_population(T, scen_properties.SEP_mapping)
+        T_new = T
+
+    else:
+        T['alt'] = T['altitude_km']
+        T['sma'] = T['semi_major_axis_km']
+        T['ecc'] = T['eccentricity']
+        T['species_class'] = T['species_opus_mass_rule']
+        T['mass'] = T['mass_kg']
+        T_new = T[(T['alt'] >= scen_properties.min_altitude) & (T['alt'] <= scen_properties.max_altitude)] 
+    
+    # Create a list to store processed dataframes
+    processed_dfs = []
+    
+    for species_class in T_new['species_class'].unique():
+        if species_class in scen_properties.species_cells:
+            if len(scen_properties.species_cells[species_class]) == 1:
+                T_obj_class = T_new[T_new['species_class'] == species_class].copy()
+                T_obj_class['species'] = scen_properties.species_cells[species_class][0].sym_name
+                processed_dfs.append(T_obj_class)
+            else:
+                species_cells = scen_properties.species_cells[species_class]
+                T_obj_class = T_new[T_new['species_class'] == species_class].copy()
+                T_obj_class['species'] = T_obj_class['mass'].apply(find_mass_bin, args=(scen_properties, species_cells)) 
+                processed_dfs.append(T_obj_class)
+    
+    # Concatenate all processed dataframes
+    if processed_dfs:
+        T_new = pd.concat(processed_dfs, ignore_index=True)
+
+    print(f"Number of objects for each species in T_new: {T_new['species'].value_counts()}")
+
+    if 'OPUS' not in file_path:
+        # T_new['epoch_start_datetime'] = pd.to_datetime(dict(
+        #     year=T_new['year_start'].astype(int),
+        #     month=T_new['month_start'].astype(int),
+        #     day=T_new['day_start'].astype(int)
+        # ), errors='coerce')
+
+        # T_new['epoch_end_datetime'] = pd.to_datetime(dict(
+        #     year=T_new['year_final'].astype(int),
+        #     month=T_new['month_final'].astype(int),
+        #     day=T_new['day_final'].astype(int)
+        # ), errors='coerce')
+        T_new['epoch_start_datetime'] = pd.to_datetime(T_new['epoch_start_datetime'], errors='coerce')
+        T_new['year_start'] = T_new['epoch_start_datetime'].dt.year
+    else:
+        # Convert decimal launch_year to datetime if it exists
+        if 'launch_year' in T_new.columns:
+            def decimal_year_to_datetime(decimal_year):
+                if pd.isna(decimal_year):
+                    return pd.NaT
+                try:
+                    # Convert decimal year to datetime
+                    year = int(decimal_year)
+                    fraction = decimal_year - year
+                    # Calculate day of year from fraction
+                    days_in_year = 365 if year % 4 != 0 else 366  # Handle leap years
+                    day_of_year = int(fraction * days_in_year) + 1
+                    return pd.to_datetime(f"{year}-{day_of_year:03d}", format="%Y-%j")
+                except:
+                    return pd.NaT
+            
+            T_new['epoch_start_datetime'] = T_new['launch_year'].apply(decimal_year_to_datetime)
+        else:
+            raise ValueError("launch_year column not found in T_new dataframe.")
+    
+
+    T_new['alt_bin'] = T_new['alt'].apply(find_alt_bin, args=(scen_properties,))
+
+    # Filter T_new to include only species present in scen_properties
+    T_new = T_new[T_new['species'].isin(scen_properties.species_names)]
+
+    # Initial population
+    x0 = T_new[T_new['epoch_start_datetime'] <= scen_properties.start_date]
+
+    # x0['species'].value_counts().plot(kind='bar', figsize=(12, 6))
+
+    x0.to_csv(os.path.join('pyssem', 'utils', 'launch', 'data', 'x0.csv'))
+
+    if scen_properties.elliptical:
+        # === 3D case: [alt_bin, species_idx, ecc_bin] ===
+        # Bin eccentricity
+        ecc_edges = np.array(scen_properties.eccentricity_bins)
+        x0['ecc_bin'] = pd.cut(x0['ecc'], bins=ecc_edges, labels=False, include_lowest=True)
+
+        # Also do it to do T_new for launch
+        T_new['ecc_bin'] = pd.cut(T_new['ecc'], bins=ecc_edges, labels=False, include_lowest=True)
+
+        # Create empty 3D summary array
+        n_shells = scen_properties.n_shells
+        n_species = len(scen_properties.species_names)
+        n_ecc_bins = len(ecc_edges) - 1
+
+        x0_summary = np.zeros((n_shells, n_species, n_ecc_bins), dtype=int)
+
+        # Map species name → index
+        species_name_to_index = {name: idx for idx, name in enumerate(scen_properties.species_names)}
+
+        # Fill in the summary
+        for _, row in x0.iterrows():
+            alt_bin = row['alt_bin']
+            species_idx = species_name_to_index.get(row['species'], None)
+            ecc_bin = row['ecc_bin']
+
+            if pd.notna(ecc_bin) and species_idx is not None:
+                x0_summary[alt_bin, species_idx, int(ecc_bin)] += 1
+
+    else:
+        # === Standard 2D case: DataFrame [alt_bin, species] ===
+        df = x0.pivot_table(index='alt_bin', columns='species', aggfunc='size', fill_value=0)
+        x0_summary = pd.DataFrame(index=range(scen_properties.n_shells), columns=scen_properties.species_names).fillna(0)
+        # x0_summary.update(df.reindex(columns=x0_summary.columns, fill_value=0))
+        # Replace the problematic line with:
+        df_pivot = df.reindex(columns=x0_summary.columns, fill_value=0)
+
+        # Check for and handle duplicate columns
+        if df_pivot.columns.duplicated().any():
+            # Sum duplicate columns
+            df_pivot = df_pivot.groupby(df_pivot.columns, axis=1).sum()
+
+        # Then update
+        x0_summary.update(df_pivot)
+
+    if scen_properties.baseline:
+        return x0_summary, None
+
+    if scen_properties.opus:
+        if 'OPUS' not in file_path and not scen_properties.baseline:
+            raise ValueError("OPUS data is not supported for non-baseline scenarios.")
+
+    # # Future Launch Model (updated)
+    # flm_steps = pd.DataFrame()
+
+    # time_increment_per_step = scen_properties.simulation_duration / scen_properties.steps
+
+    # time_steps = [
+    #     scen_properties.start_date + timedelta(days=365.25 * time_increment_per_step * i) 
+    #     for i in range(scen_properties.steps + 1)
+    # ]    
+
+    # # Distribute the Yearly Launches, USED FOR STEP FUNCTION, but also works w/ current and old interp
+    # start_year = scen_properties.start_date.year
+    # end_year = start_year + scen_properties.simulation_duration
+
+    # for year in tqdm(range(start_year, end_year), desc="Processing Launch Years"):
+        
+    #     launches_this_year = T_new[T_new['year_start'] == year]
+        
+    #     if launches_this_year.empty:
+    #         continue
+
+    #     # Group by shell and species to get total counts for the entire year
+    #     # yearly_counts = launches_this_year.groupby(['alt_bin', 'species']).size().unstack(fill_value=0)
+    #     if scen_properties.elliptical:
+    #         yearly_counts = launches_this_year.groupby(['alt_bin', 'ecc_bin', 'species']).size()
+    #         yearly_counts = yearly_counts.unstack(fill_value=0)
+
+    #         all_alt_ecc_bins = pd.MultiIndex.from_product(
+    #             [range(scen_properties.n_shells), range(len(ecc_edges) - 1)],
+    #             names=['alt_bin', 'ecc_bin']
+    #         )
+    #         yearly_counts = yearly_counts.reindex(all_alt_ecc_bins, fill_value=0)
+
+    #     else:
+    #         yearly_counts = launches_this_year.groupby(['alt_bin', 'species']).size().unstack(fill_value=0)
+    #         yearly_counts = yearly_counts.reindex(range(scen_properties.n_shells), fill_value=0)
+
+    #     # --- START OF THE FIX ---
+    #     # Ensure the yearly_counts DataFrame has a row for every possible shell.
+    #     # This is the step that was missing from my previous version.
+    #     # --- END OF THE FIX ---
+
+    #     # Find which simulation time steps fall within this calendar year
+    #     year_start_date = datetime(year, 1, 1)
+    #     year_end_date = datetime(year + 1, 1, 1)
+        
+    #     relevant_steps_mask = (np.array(time_steps[:-1]) >= year_start_date) & (np.array(time_steps[:-1]) < year_end_date)
+    #     relevant_start_times = np.array(time_steps[:-1])[relevant_steps_mask]
+
+    #     if len(relevant_start_times) == 0:
+    #         continue
+
+    #     # Use only the first time step in the year (mimicking MC behavior)
+    #     step_counts = yearly_counts.copy()
+    #     step_counts = step_counts.reset_index()
+    #     step_counts['epoch_start_date'] = relevant_start_times[0]
+
+    #     flm_steps = pd.concat([flm_steps, step_counts], ignore_index=True)
+
+    # # Final re-ordering and cleanup
+    # # Ensure all species columns from the scenario are present, even if they had no launches
+    # all_species_columns = scen_properties.species_names
+    # for col in all_species_columns:
+    #     if col not in flm_steps.columns:
+    #         flm_steps[col] = 0
+
+    # # Ensure consistent column order
+    # if scen_properties.elliptical:
+    #     final_cols = ['epoch_start_date', 'alt_bin', 'ecc_bin'] + all_species_columns
+    # else:
+    #     final_cols = ['epoch_start_date', 'alt_bin'] + all_species_columns
+
+    # flm_steps = flm_steps[final_cols]
+
+    # return x0_summary, flm_steps
+
+    # Future Launch Model (Fixed for Continuity)
+    flm_steps = pd.DataFrame()
+
+    # Create the time grid for the simulation
+    time_increment_per_step = scen_properties.simulation_duration / scen_properties.steps
+    time_steps = [
+        scen_properties.start_date + timedelta(days=365 * time_increment_per_step * i) 
+        for i in range(scen_properties.steps + 1)
+    ]    
+
+    start_year = scen_properties.start_date.year
+    end_year = start_year + scen_properties.simulation_duration
+
+    # We use enumerate so we can match the Year to the exact Index in time_steps
+    for i, year in enumerate(tqdm(range(start_year, end_year), desc="Processing Launch Years")):
+        
+        launches_this_year = T_new[T_new['year_start'] == year]
+        
+        # --- FIX 1: Ensure we always have data for every altitude and species ---
+        if launches_this_year.empty:
+            # Create a zero-filled DataFrame for this year
+            yearly_counts = pd.DataFrame(
+                0, 
+                index=range(scen_properties.n_shells), 
+                columns=scen_properties.species_names
+            )
+        else:
+            # Group and then reindex to force the full 0-23 shell range
+            yearly_counts = launches_this_year.groupby(['alt_bin', 'species']).size().unstack(fill_value=0)
+            yearly_counts = yearly_counts.reindex(
+                index=range(scen_properties.n_shells), 
+                columns=scen_properties.species_names, 
+                fill_value=0
+            )
+
+        # --- FIX 2: Direct Mapping to Time Steps ---
+        # Instead of searching for "relevant steps" which might be empty due to math errors,
+        # we directly assign the i-th simulation step to the i-th calendar year.
+        step_counts = yearly_counts.copy()
+        step_counts = step_counts.reset_index().rename(columns={'index': 'alt_bin'})
+        
+        # Assign the timestamp from our pre-calculated simulation grid
+        if i < len(time_steps):
+            step_counts['epoch_start_date'] = time_steps[i]
+        else:
+            # Fallback if simulation duration is longer than steps (safety)
+            step_counts['epoch_start_date'] = scen_properties.start_date + timedelta(days=365.25 * i)
+
+        flm_steps = pd.concat([flm_steps, step_counts], ignore_index=True)
+
+    # Final cleanup logic remains the same...
+    all_species_columns = scen_properties.species_names
+    for col in all_species_columns:
+        if col not in flm_steps.columns:
+            flm_steps[col] = 0
+
+    final_cols = ['epoch_start_date', 'alt_bin'] + all_species_columns
+    flm_steps = flm_steps[final_cols]
+
+    return x0_summary, flm_steps
+
+
 def SEP_traffic_model(scen_properties, file_path):
     """
     This will take one of the SEP files, users must select on of the Space Environment Pathways (SEPs), see: https://www.researchgate.net/publication/385299836_Development_of_Reference_Scenarios_and_Supporting_Inputs_for_Space_Environment_Modeling

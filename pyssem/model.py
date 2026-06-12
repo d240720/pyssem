@@ -311,7 +311,7 @@ class Model:
             self.scenario_properties.build_sym_model()
 
             # save the scenario properties to a pickle file
-            with open('test_3_species_sym.pkl', 'wb') as f:            
+            with open('test_SEP_workshop_no_frag_spread.pkl', 'wb') as f:            
                 pickle.dump(self.scenario_properties, f)
         
         except Exception as e:
@@ -368,7 +368,9 @@ if __name__ == "__main__":
     # with open(os.path.join('pyssem', 'simulation_configurations', 'elliptical.json')) as f:
     # with open(os.path.join('pyssem', 'simulation_configurations', 'three_species.json')) as f:
     # with open(os.path.join('pyssem', 'simulation_configurations', 'elliptical-test.json')) as f:
-    with open(os.path.join('pyssem', 'simulation_configurations', 'three_species_sym.json')) as f:
+    # with open(os.path.join('pyssem', 'simulation_configurations', 'three_species_sym.json')) as f:
+    # with open(os.path.join('pyssem', 'simulation_configurations', 'cluster_sep_species_sym.json')) as f:
+    with open(os.path.join('pyssem', 'simulation_configurations', 'workshop_sym.json')) as f:
         simulation_data = json.load(f)
 
     scenario_props = simulation_data["scenario_properties"]
