@@ -132,7 +132,7 @@ campaigns = [
 
     # Per-year example: explicit sats/year for years 0,1,2,... (length need not
     # equal steps; it's interpolated onto scen_times). Uncomment to use:
-    ("S", 700, [0, 0, 30, 45, 60, 60, 60, 80, 120, 150] + [150]*90),
+    # ("S", 700, [0, 0, 30, 45, 60, 60, 60, 80, 120, 150] + [150]*90),
 ]
 
 
@@ -165,6 +165,67 @@ for group in scen.species.values():
         if getattr(species, "active", False):
             species.launch_func = launch_func_lambda_fun
             species.lambda_funs = launch_by_species.get(species.sym_name, [None] * n_shells)
+
+
+# ----------------------------------------------------------------------
+# 4b) Rocket-body injection: for every satellite launched, deposit the
+#     expected number of surviving spent stages (per rb_injection.json).
+#     B_rate[k'] = sum_k S_rate[k] * R_persat[band(k)][band(k')] spread over
+#     the shells of band(k').  Set RB_INJECTION = None to disable.
+# ----------------------------------------------------------------------
+RB_INJECTION = "rb_injection.json"   # from build_rb_injection.py; None to skip
+
+if RB_INJECTION:
+    with open(RB_INJECTION) as f:
+        inj = json.load(f)
+    bands = inj["bands"]
+    R_band = np.asarray(inj["R_persat"])           # (n_band, n_band)
+
+    def band_of_alt(alt):
+        for i, (lo, hi) in enumerate(bands):
+            if lo <= alt < hi:
+                return i
+        return -1
+
+    shell_band = np.array([band_of_alt(h) for h in HMid])       # band index per shell
+    shells_in_band = {b: np.where(shell_band == b)[0] for b in range(len(bands))}
+
+    # Total satellite launch rate per shell over time: (n_shells, n_times)
+    n_times = len(t)
+    S_rate = np.zeros((n_shells, n_times))
+    for sym in active_names:
+        for k, arr in enumerate(launch_by_species.get(sym, [None] * n_shells)):
+            if arr is not None:
+                S_rate[k] += arr
+
+    # Map through the injection matrix into rocket-body launches per shell.
+    B_rate = np.zeros((n_shells, n_times))
+    for k in range(n_shells):
+        b = shell_band[k]
+        if b < 0 or not S_rate[k].any():
+            continue
+        for bp in range(len(bands)):
+            dest = shells_in_band.get(bp, [])
+            if R_band[b, bp] == 0 or len(dest) == 0:
+                continue
+            per_shell = R_band[b, bp] / len(dest)      # spread uniformly within dest band
+            for kp in dest:
+                B_rate[kp] += S_rate[k] * per_shell
+
+    # Assign to the rocket-body species (RBflag == 1).
+    rb_species = [s for g in scen.species.values() for s in g
+                  if getattr(s, "RBflag", 0) == 1]
+    if not rb_species:
+        print("  WARNING: RB_INJECTION set but no species with RBflag==1 found; skipping.")
+    else:
+        b_funs = [B_rate[kp] if B_rate[kp].any() else None for kp in range(n_shells)]
+        for s in rb_species:
+            s.launch_func = launch_func_lambda_fun
+            s.lambda_funs = b_funs
+        _trapz0 = getattr(np, "trapezoid", None) or getattr(np, "trapz", None)
+        print(f"Rocket-body injection ON ({rb_species[0].sym_name}): "
+              f"~{_trapz0(B_rate.sum(axis=0), t):,.0f} stages launched over the run "
+              f"(mass {inj['stage_mass_kg']:.0f} kg).")
 
 
 # ----------------------------------------------------------------------
@@ -216,17 +277,24 @@ start_year = getattr(getattr(scen, "start_date", None), "year", None)
 xt = (start_year + out.t) if start_year else out.t
 xlabel = "year" if start_year else "years from start"
 
-# --- Figure 1: total population over time, per species (+ grand total) ---
-fig1, ax = plt.subplots(figsize=(9, 5))
-for name, series in totals.items():
-    ax.plot(xt, series, linewidth=2, label=name)
-ax.plot(xt, np.sum(list(totals.values()), axis=0),
-        linewidth=1.5, linestyle="--", color="black", label="total")
-ax.set_xlabel(xlabel)
-ax.set_ylabel("number of objects")
-ax.set_title("LEO population over time by species")
-ax.grid(True, alpha=0.3)
-ax.legend()
+# --- Figure 1: population over time, ONE PANEL PER SPECIES (own y-scale) ---
+n_sp = len(species_names)
+ncols = 2 if n_sp > 1 else 1
+nrows = int(np.ceil(n_sp / ncols))
+fig1, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 3 * nrows),
+                          sharex=True, squeeze=False)
+flat = axes.ravel()
+for idx, name in enumerate(species_names):
+    axp = flat[idx]
+    axp.plot(xt, totals[name], linewidth=2, color=f"C{idx}")
+    axp.set_title(name)
+    axp.set_ylabel("objects")
+    axp.grid(True, alpha=0.3)
+for idx in range(n_sp, len(flat)):        # hide any unused panels
+    flat[idx].axis("off")
+for c in range(ncols):                     # x-labels on the bottom row
+    flat[min((nrows - 1) * ncols + c, len(flat) - 1)].set_xlabel(xlabel)
+fig1.suptitle("Population over time by species")
 fig1.tight_layout()
 fig1.savefig("population_over_time.png", dpi=130)
 
@@ -246,4 +314,84 @@ fig2.tight_layout()
 fig2.savefig("population_by_altitude.png", dpi=130)
 
 print("Saved plots: population_over_time.png, population_by_altitude.png")
+
+
+# ----------------------------------------------------------------------
+# 8) Collision probability per satellite, per shell (height band), over time.
+#    Reproduces pyssem's own collision rate  gamma * phi * N_i * N_j, where
+#      phi[k] = pi * v_imp_all[k] / (V[k] in km^3) * (r_i + r_j)^2 (km^2) * sec/yr
+#      gamma  = collision-avoidance factor (alpha / alpha_active / slotting)
+#    For an active species S:
+#      p_S[k,t] = sum_j  gamma(S,j) * phi(S,j)[k] * N_j[k,t]
+#    Units: expected collisions per satellite per year (~ annual collision prob).
+# ----------------------------------------------------------------------
+from matplotlib.colors import LogNorm
+
+V_shell = np.asarray(scen.V, dtype=float)                 # shell volume [m^3]
+v_imp_all = np.asarray(scen.v_imp_all, dtype=float)       # per-shell impact vel [km/s]
+if v_imp_all.ndim == 0:
+    v_imp_all = np.full(n_shells, float(v_imp_all))
+M2KM, SEC_PER_YEAR = 1e-3, 86400.0 * 365.25
+
+info, active_flag = {}, {}
+for g in scen.species.values():
+    for s in g:
+        info[s.sym_name] = dict(
+            r=float(s.radius), man=bool(s.maneuverable), trk=bool(s.trackable),
+            alpha=float(s.alpha or 0.0), alpha_active=float(s.alpha_active or 0.0),
+            slotted=bool(getattr(s, "slotted", False)),
+            slot_eff=float(getattr(s, "slotting_effectiveness", 0.0) or 0.0))
+        active_flag[s.sym_name] = getattr(s, "active", False)
+
+def phi_pair(ri, rj):
+    sigma = (ri * M2KM + rj * M2KM) ** 2                  # km^2
+    return np.pi * v_imp_all / (V_shell * M2KM ** 3) * sigma * SEC_PER_YEAR   # (n_shells,)
+
+def gamma_factor(a, b):
+    if a["man"] and b["man"]:
+        gf = a["alpha_active"] * b["alpha_active"]
+        if a["slotted"] and b["slotted"]:
+            gf *= min(a["slot_eff"], b["slot_eff"])
+        return gf
+    if a["man"] ^ b["man"]:
+        man, non = (a, b) if a["man"] else (b, a)
+        return man["alpha"] if non["trk"] else 1.0
+    return 1.0
+
+def species_block(nm):
+    i = species_names.index(nm)
+    return out.y[i * n_shells:(i + 1) * n_shells, :]      # (n_shells, n_times)
+
+sats = [nm for nm in species_names if active_flag.get(nm, False)]
+coll_prob = {}
+for S in sats:
+    p = np.zeros((n_shells, len(out.t)))
+    for j in species_names:
+        p += gamma_factor(info[S], info[j]) * phi_pair(info[S]["r"], info[j]["r"])[:, None] * species_block(j)
+    coll_prob[S] = p
+
+np.savez("collision_probability.npz", time=out.t, altitude_km=HMid,
+         **{f"p_{S}": coll_prob[S] for S in sats})
+
+for S in sats:
+    p = coll_prob[S]
+    fig, axh = plt.subplots(figsize=(9, 5))
+    pos = p[p > 0]
+    if pos.size:
+        norm = LogNorm(vmin=pos.min(), vmax=p.max())
+    else:
+        norm = None
+    mesh = axh.pcolormesh(xt, HMid, p, shading="auto", norm=norm, cmap="magma")
+    axh.set_xlabel(xlabel)
+    axh.set_ylabel("altitude [km]")
+    axh.set_title(f"{S}: collision probability per satellite per year")
+    fig.colorbar(mesh, ax=axh, label="expected collisions / sat / yr")
+    fig.tight_layout()
+    fig.savefig(f"collision_prob_{S}.png", dpi=130)
+    # peak shell at final time
+    kmax = int(np.argmax(p[:, -1]))
+    print(f"{S}: peak collision prob at t={out.t[-1]:.0f} is "
+          f"{p[kmax, -1]:.2e} /sat/yr at {HMid[kmax]:.0f} km")
+
+print("Saved collision_probability.npz and collision_prob_<species>.png")
 print("Done.")
