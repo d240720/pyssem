@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+fetch_catalogs.py
+
+Reproducible, dated fetch of the source catalogs the IC pipeline needs.
+Python port of fetch_catalogs.sh.
+
+  2026.csv    Space-Track GP snapshot of the on-orbit LEO-region catalog.
+              Predicates: DECAY_DATE=null, MEAN_MOTION>3, ordered by NORAD_CAT_ID.
+              NOTE: the DECAY_DATE=null predicate is what makes "surviving" mean
+              anything downstream -- build_rb_injection.py's DECAY_DATE.isna()
+              filter is a no-op precisely because this query already applied it.
+              Drop the predicate here and R_persat silently changes meaning.
+
+  satcat.csv  NORAD_CAT_ID -> OBJECT_ID map + operational status, used for exact
+              launch pairing and live/dead payload classification.
+              CelesTrak by default; --satcat-spacetrack for the Space-Track SATCAT.
+
+Each download is written to a temp file, validated, and only then moved into place,
+so a failed fetch never clobbers a good catalog. A dated archival copy + manifest
+(sha256, row count, exact query) are recorded so the fetch is a committed step.
+
+CREDENTIALS (never hard-coded):
+    export ST_USER='you@example.com'; export ST_PASS='...'
+  or put ST_USER=/ST_PASS= in space_track.env next to this script.
+  ADD space_track.env TO .gitignore.
+
+USAGE:
+    python3 fetch_catalogs.py                      # both, CelesTrak SATCAT
+    python3 fetch_catalogs.py --satcat-spacetrack  # both, Space-Track SATCAT
+    python3 fetch_catalogs.py --gp-only
+    python3 fetch_catalogs.py --satcat-only
+    python3 fetch_catalogs.py --outdir /data
+
+REPRODUCIBILITY CAVEAT: class/gp returns the CURRENT on-orbit catalog, so a later
+run is a LATER snapshot -- hence the dated archive + sha256. A true historical
+freeze would need class/gp_history with an EPOCH window.
+"""
+
+import argparse
+import csv
+import hashlib
+import os
+import shutil
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+ST_BASE = "https://www.space-track.org"
+GP_QUERY = ("/basicspacedata/query/class/gp/DECAY_DATE/null-val"
+            "/MEAN_MOTION/>3/orderby/NORAD_CAT_ID/format/csv")
+SATCAT_QUERY = "/basicspacedata/query/class/satcat/orderby/NORAD_CAT_ID/format/csv"
+CELESTRAK_URL = "https://celestrak.org/pub/satcat.csv"
+UA = "fetch_catalogs.py (research use)"
+
+# Columns the downstream scripts actually read. The bash version verified
+# RCS_SIZE/SEMIMAJOR_AXIS/MEAN_ANOMALY (unused) while omitting APOAPSIS, PERIAPSIS,
+# DECAY_DATE and OBJECT_ID -- i.e. the ones that define altitude and launch pairing.
+GP_REQUIRED = ["NORAD_CAT_ID", "OBJECT_ID", "OBJECT_TYPE", "LAUNCH_DATE",
+               "DECAY_DATE", "APOAPSIS", "PERIAPSIS", "RCS_SIZE"]
+# CelesTrak uses OBJECT_ID, Space-Track SATCAT uses INTLDES; either is accepted.
+SATCAT_REQUIRED = ["NORAD_CAT_ID", "OPS_STATUS_CODE"]
+SATCAT_EITHER = ["OBJECT_ID", "INTLDES"]
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def read_header(path):
+    """First row of a CSV, quote/CRLF tolerant."""
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        try:
+            return next(csv.reader(f))
+        except StopIteration:
+            return []
+
+
+def verify_columns(path, required, either=()):
+    """Raise if the CSV is missing any required column."""
+    header = [c.strip().lstrip("\ufeff") for c in read_header(path)]
+    missing = [c for c in required if c not in header]
+    if either and not any(c in header for c in either):
+        missing.append("/".join(either))
+    if missing:
+        raise ValueError(
+            f"{path}: missing column(s) {missing}\n  header was: {header[:12]}"
+            f"{' ...' if len(header) > 12 else ''}")
+    return header
+
+
+def count_rows(path):
+    """Data rows (excludes the header)."""
+    with open(path, "rb") as f:
+        n = sum(1 for _ in f)
+    return max(0, n - 1)
+
+
+def norad_count(path, predicate):
+    """Rows whose NORAD_CAT_ID satisfies `predicate`."""
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        r = csv.DictReader(f)
+        if "NORAD_CAT_ID" not in (r.fieldnames or []):
+            return 0
+        c = 0
+        for row in r:
+            try:
+                if predicate(int(float(row["NORAD_CAT_ID"]))):
+                    c += 1
+            except (TypeError, ValueError):
+                continue
+    return c
+
+
+def download(session, url, dest_tmp, **kw):
+    """Stream a URL to a temp path. Raises on any non-2xx."""
+    with session.get(url, stream=True, timeout=300, **kw) as resp:
+        resp.raise_for_status()
+        with open(dest_tmp, "wb") as f:
+            for chunk in resp.iter_content(1 << 20):
+                f.write(chunk)
+
+
+def fetch(session, url, final_path, required, either=(), source="", query=""):
+    """Download -> verify -> atomically move into place. A failed or malformed
+    download never overwrites the existing file."""
+    fd, tmp = tempfile.mkstemp(prefix=".fetch_", dir=str(final_path.parent))
+    os.close(fd)
+    try:
+        download(session, url, tmp)
+        verify_columns(tmp, required, either)
+        shutil.move(tmp, final_path)          # only now do we clobber
+    except Exception:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return final_path
+
+
+def archive_and_record(path, snapdir, manifest, source, query, fetched_utc):
+    rows, sha = count_rows(path), sha256(path)
+    snapdir.mkdir(parents=True, exist_ok=True)
+    tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+    snap = snapdir / f"{path.name}.{tag}"
+    shutil.copy2(path, snap)
+
+    new = not manifest.exists()
+    with open(manifest, "a", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        if new:
+            w.writerow(["fetched_utc", "file", "source", "rows", "sha256",
+                        "query_or_url"])
+        w.writerow([fetched_utc, path.name, source, rows, sha, query])
+
+    print(f"  rows={rows}  sha256={sha[:12]}...  archived -> {snap}")
+    return rows
+
+
+def space_track_session(outdir):
+    """Authenticated Space-Track session. Credentials from env or space_track.env."""
+    env = Path(__file__).resolve().parent / "space_track.env"
+    if not env.exists():
+        env = outdir / "space_track.env"
+    if env.exists():
+        for line in env.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
+    user, pw = os.environ.get("ST_USER"), os.environ.get("ST_PASS")
+    if not user or not pw:
+        sys.exit("Set ST_USER and ST_PASS (env or space_track.env) for Space-Track.")
+
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
+    print("  authenticating to Space-Track...")
+    r = s.post(f"{ST_BASE}/ajaxauth/login",
+               data={"identity": user, "password": pw}, timeout=60)
+    r.raise_for_status()
+    if "Failed" in r.text or "login" in r.url.lower():
+        sys.exit("  Space-Track login failed (check ST_USER / ST_PASS).")
+    return s
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--outdir", default=".")
+    ap.add_argument("--gp-only", action="store_true")
+    ap.add_argument("--satcat-only", action="store_true")
+    ap.add_argument("--satcat-spacetrack", action="store_true",
+                    help="pull SATCAT from Space-Track instead of CelesTrak")
+    a = ap.parse_args()
+
+    outdir = Path(a.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    snapdir = outdir / "catalog_snapshots"
+    manifest = snapdir / "MANIFEST.tsv"
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    do_gp = not a.satcat_only
+    do_satcat = not a.gp_only
+    st = None
+
+    # ---- 1) Space-Track GP -> 2026.csv --------------------------------------
+    if do_gp:
+        gp_path = outdir / "2026.csv"
+        print(f"[1/2] Space-Track GP on-orbit LEO-region catalog -> {gp_path}")
+        st = space_track_session(outdir)
+        print("  querying GP catalog...")
+        fetch(st, ST_BASE + GP_QUERY, gp_path, GP_REQUIRED)
+        archive_and_record(gp_path, snapdir, manifest, "space-track:gp", GP_QUERY, now)
+
+        total = count_rows(gp_path)
+        kept = norad_count(gp_path, lambda n: n <= 80000)
+        big6 = norad_count(gp_path, lambda n: n >= 100000)
+        print(f"  total={total}  kept(<=80000)={kept}  "
+              f"(original June-2026 snapshot: 30086 -> 29039)")
+        if big6:
+            print(f"  NOTE: {big6} objects have 6-digit NORAD IDs; the >80000 build "
+                  f"filter drops them. Analyst objects and new-scheme catalog numbers "
+                  f"now overlap in this range -- a numeric threshold can no longer "
+                  f"separate them. Resolve deliberately.")
+    else:
+        print("[1/2] skipped GP (--satcat-only)")
+
+    # ---- 2) SATCAT ----------------------------------------------------------
+    if do_satcat:
+        sc_path = outdir / "satcat.csv"
+        if a.satcat_spacetrack:
+            print(f"[2/2] Space-Track SATCAT -> {sc_path}")
+            st = st or space_track_session(outdir)
+            url, label, ref = ST_BASE + SATCAT_QUERY, "space-track:satcat", SATCAT_QUERY
+            sess = st
+        else:
+            print(f"[2/2] CelesTrak SATCAT -> {sc_path}")
+            sess = requests.Session()
+            sess.headers["User-Agent"] = UA
+            url, label, ref = CELESTRAK_URL, "celestrak:satcat", CELESTRAK_URL
+
+        try:
+            fetch(sess, url, sc_path, SATCAT_REQUIRED, SATCAT_EITHER)
+        except requests.HTTPError as e:
+            sys.exit(f"  SATCAT fetch failed: {e}\n"
+                     f"  (CelesTrak anti-bot? try --satcat-spacetrack)")
+        archive_and_record(sc_path, snapdir, manifest, label, ref, now)
+
+        bignum = norad_count(sc_path, lambda n: n >= 100000)
+        if bignum:
+            print(f"  WARNING: satcat.csv has {bignum} objects with 6-digit catalog "
+                  f"numbers (>=100000); the >80000 temp-ID filter in the build scripts "
+                  f"will discard these. Revisit that threshold before regenerating.")
+    else:
+        print("[2/2] skipped SATCAT (--gp-only)")
+
+    print(f"\nDone. Manifest: {manifest}")
+    print("Commit catalog_snapshots/ (dated copies + manifest); "
+          "keep space_track.env untracked.")
+
+
+if __name__ == "__main__":
+    main()

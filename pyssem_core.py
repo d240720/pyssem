@@ -39,6 +39,88 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------
+# Rocket-body injection file (per-band format)
+# --------------------------------------------------------------------------
+def _load_rb_injection(path):
+    """Load rb_injection.json, normalising old (scalar) and new (per-band) formats.
+
+    New format: stage_mass_kg / stage_radius_m are length-n_bands VECTORS indexed by
+    the DESTINATION band (the column of R_persat) -- stages landing at 700-1000 km are
+    ~4 t upper stages, those at 400-600 km are ~2.5 t. Old files carry scalars; those
+    are broadcast across all bands so this stays backward compatible.
+    """
+    with open(path) as f:
+        inj = json.load(f)
+    nb = len(inj["bands"])
+
+    def as_vec(key, fallback_key, default):
+        v = inj.get(key, inj.get(fallback_key, default))
+        if np.isscalar(v):
+            return np.full(nb, float(v))
+        v = np.asarray(v, float)
+        if len(v) != nb:
+            raise ValueError(f"{path}: '{key}' has length {len(v)}, expected {nb} bands")
+        return v
+
+    inj["_mass"] = as_vec("stage_mass_kg", "stage_mass_kg_pooled", 1500.0)
+    inj["_radius"] = as_vec("stage_radius_m", "stage_radius_m_pooled", 2.0)
+    inj["_R"] = np.asarray(inj["R_persat"], float)
+    return inj
+
+
+def _band_of_factory(bands):
+    def band_of(alt):
+        for i, (lo, hi) in enumerate(bands):
+            if lo <= alt < hi:
+                return i
+        return -1
+    return band_of
+
+
+def _rb_stage_properties(cfg):
+    """Collapse the per-band stage mass/radius vectors to the single (mass, radius)
+    that pyssem's one-RB-species model can represent, weighted by the stage flux this
+    scenario's launch schedule will actually deposit in each band.
+
+    Must run BEFORE configure_species(): species mass/radius are baked into the
+    symbolic equations there, so mutating them later is a no-op.
+
+    Mass is flux-weighted (conserves the deposited mass budget the breakup model
+    consumes). Radius is flux-weighted in AREA, then converted back -- collision rate
+    scales with cross-section, so averaging radius directly would under-count area.
+    """
+    inj = _load_rb_injection(cfg["rb_injection"])
+    bands, R = inj["bands"], inj["_R"]
+    band_of = _band_of_factory(bands)
+    nb = len(bands)
+
+    # Payload volume launched into each band over the run (arbitrary common units --
+    # only the relative weights matter).
+    t = np.linspace(0.0, float(cfg.get("years", 100)), int(cfg.get("steps", 200)))
+    vol = np.zeros(nb)
+    for _sym, alt, prof in cfg.get("launches", []):
+        b = band_of(alt)
+        if b < 0:
+            continue
+        if callable(prof):
+            rate = np.maximum(0.0, np.asarray(prof(t), float))
+        else:
+            a = np.asarray(prof, float)
+            rate = np.maximum(0.0, np.interp(t, np.linspace(t[0], t[-1], len(a)), a))
+        vol[b] += float(np.trapezoid(rate, t)) if hasattr(np, "trapezoid") \
+            else float(np.trapz(rate, t))
+
+    w = vol @ R                                  # stages deposited per destination band
+    if w.sum() <= 0:                             # no launches -> fall back to a plain mean
+        w = np.ones(nb)
+
+    mass = float(np.average(inj["_mass"], weights=w))
+    area = np.pi * inj["_radius"] ** 2
+    radius = float(np.sqrt(np.average(area, weights=w) / np.pi))
+    return mass, radius, w, inj
+
+
+# --------------------------------------------------------------------------
 # Config -> scenario / species overrides
 # --------------------------------------------------------------------------
 def _apply_scenario_params(sp, cfg):
@@ -66,6 +148,34 @@ def _apply_species_params(conf, cfg):
             if radius is not None:
                 s["radius"] = radius
                 s["A"] = "Calculated based on radius"   # recompute area from new radius
+
+
+def _apply_rb_species_params(conf, cfg):
+    """Set the RBflag species' mass/radius from the rb_injection file, flux-weighted
+    across destination bands. Runs before configure_species() so the values reach the
+    symbolic equations. Explicit CONFIG values (rb_mass / rb_radius) win."""
+    if not cfg.get("rb_injection"):
+        return
+    mass, radius, w, inj = _rb_stage_properties(cfg)
+    mass = cfg.get("rb_mass") if cfg.get("rb_mass") is not None else mass
+    radius = cfg.get("rb_radius") if cfg.get("rb_radius") is not None else radius
+
+    rb = [s for s in conf["species"] if s.get("RBflag", 0) == 1]
+    if not rb:
+        print("  warning: rb_injection set but no RBflag==1 species in config; "
+              "stage mass/radius not applied")
+        return
+    for s in rb:
+        s["mass"] = float(mass)
+        s["radius"] = float(radius)
+        s["A"] = "Calculated based on radius"
+
+    shares = w / w.sum() if w.sum() > 0 else w
+    print(f"  rb stage props: {mass:.0f} kg, r_eff {radius:.2f} m "
+          f"(flux-weighted over bands; per-band mass "
+          f"{np.array2string(inj['_mass'], precision=0, separator=',')})")
+    print(f"  rb stage flux share by destination band: "
+          f"{np.array2string(shares, precision=3, separator=',')}")
 
 
 def _apply_ic(x0, cfg, HMid):
@@ -117,6 +227,7 @@ def build_model(cfg):
     sp = conf["scenario_properties"]
     _apply_scenario_params(sp, cfg)      # grid / density overrides
     _apply_species_params(conf, cfg)     # lifetime / pmd / mass / size overrides
+    _apply_rb_species_params(conf, cfg)  # RB stage mass/radius from rb_injection
 
     model = Model(
         start_date=sp["start_date"].split("T")[0],
@@ -190,16 +301,10 @@ def set_launches(model, cfg):
 
 
 def _apply_rb_injection(scen, path, by, active, t, HMid, n):
-    with open(path) as f:
-        inj = json.load(f)
+    inj = _load_rb_injection(path)
     bands = inj["bands"]
-    R_band = np.asarray(inj["R_persat"])
-
-    def band_of(alt):
-        for i, (lo, hi) in enumerate(bands):
-            if lo <= alt < hi:
-                return i
-        return -1
+    R_band = inj["_R"]
+    band_of = _band_of_factory(bands)
 
     shell_band = np.array([band_of(h) for h in HMid])
     in_band = {b: np.where(shell_band == b)[0] for b in range(len(bands))}

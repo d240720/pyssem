@@ -9,8 +9,6 @@ run(CONFIG) RETURNS the time series in memory (writes no files):
         "populations":           {species:   (n_shells, n_times)},
         "collision_probability": {satellite: (n_shells, n_times)},
     }
-e.g.  results["populations"]["S"]           -> satellite counts by shell over time
-      results["collision_probability"]["S"] -> per-sat collision prob by shell over time
 
 Grid is fixed at 200-2000 km, 50 km shells (36 shells).
 
@@ -60,6 +58,8 @@ CONFIG = {
         ("S", 550,  lambda t: 100 + 12 * t),                          # ramp
         ("S", 340,  lambda t: 400 * ((t >= 10) & (t <= 30))),         # on/off window
         ("S", 1200, lambda t: 800 / (1 + np.exp(-0.18 * (t - 25)))),  # S-curve
+        ("S", 700,  [0]*10+[100]*50+[0]*41), #0 for years 0-9, 100 for years 10-49, and 0 after
+        ("S", 800,  [0,100]) # 0 for year 0 then 100 for all remaining years
     ],
 
     # --- rocket-body injection (spent stages per satellite) ---
@@ -77,6 +77,7 @@ CONFIG = {
 
 if __name__ == "__main__":
     results = run(CONFIG)          # <- time series returned here
+    
     time=results["time"] #time steps
     alt_km=results["altitude_km"] #center of each of the 36 bands
     pop=results["populations"] # populations, takes the keys: ['S', 'N', 'N_200kg', 'B'] where 'N_200kg' depends on set sat mass. S is sats, N is debris, B is rocket bodies, N_200kg is derelicts
