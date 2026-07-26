@@ -27,8 +27,7 @@ def main():
     ap.add_argument("--gp", default="2026.csv")
     ap.add_argument("--out", default="intact_satnos.csv")
     ap.add_argument("--max-norad", type=int, default=None,
-                    help="drop IDs above this (e.g. 80000 to match the build-script "
-                         "temp-ID filter). Default: keep everything.")
+                    help="drop IDs above this. Default: keep everything.")
     ap.add_argument("--header", action="store_true",
                     help="emit a 'satno' header row (default: headerless, as MATLAB)")
     a = ap.parse_args()
@@ -59,9 +58,7 @@ def main():
         n_big = int((satnos > 80000).sum())
         if n_big:
             print(f"  NOTE: {n_big} IDs exceed 80000 "
-                  f"({int((satnos >= 100000).sum())} are 6-digit). The >80000 filter in "
-                  f"the build scripts would discard these; they are KEPT here unless "
-                  f"--max-norad is set.")
+                  f"({int((satnos >= 100000).sum())} are 6-digit).")
 
 
 if __name__ == "__main__":

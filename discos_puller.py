@@ -5,28 +5,27 @@ Pull physical mass and average cross-section from ESA DISCOSweb for a list of
 NORAD IDs (SATNOs), to build a physically-sized IC. Uses the bearer-token v2
 API. Resumable, rate-limit aware, caches incrementally to CSV.
 
-Usage:
-  export DISCOS_TOKEN='your-token-here'
-  # smoke test on the first 5 first, to confirm auth + filter syntax:
-  python3 discos_puller.py --satnos intact_satnos.csv --out discos_cache.csv --limit 5
-  # then the full pull (safe to re-run; it skips what's already cached):
+Usage (export DISCOS_TOKEN first; ALWAYS smoke-test with --limit 5 before the
+full pull, which is safe to re-run -- it skips what's already cached):
   python3 discos_puller.py --satnos intact_satnos.csv --out discos_cache.csv
+  ... --retry-misses     # re-fetch objects previously recorded as not-found
 
-Input : CSV/txt with one NORAD ID (SATNO) per line (header line tolerated).
-Output: discos_cache.csv with columns
-        satno,cosparId,name,objectClass,mass_kg,xSectAvg_m2,radius_m,shape,found
-        found=1 means DISCOS returned the object; mass_kg may still be blank if
-        DISCOS has no measured mass for it.
+Input : CSV/txt, one NORAD ID per line (header tolerated).
+Output: satno,cosparId,name,objectClass,mass_kg,xSectAvg_m2,radius_m,shape,found
+        (found=1 with blank mass_kg = in DISCOS but no measured mass).
 
 Notes:
-  * radius_m = sqrt(xSectAvg / pi): equivalent-circle radius from the average
-    geometric cross-section -- a better collision radius than an RCS estimate.
-  * The exact rate-limit header names / filter syntax can vary by API version;
-    this handles the common cases and fails loudly otherwise. RUN --limit 5
-    FIRST so you validate auth and syntax cheaply before the full pull.
+  * radius_m = sqrt(xSectAvg/pi), equivalent-circle collision radius.
+  * Append-only for durability: readers keep the LAST row per satno
+    (load_cache does; --compact rewrites deduplicated).
+  * --retry-misses keys on found=0; found=1 rows with blank mass are never
+    re-fetched -- delete those rows (or the cache) if DISCOS may have gained data.
 """
 
 import os, sys, csv, time, math, argparse, urllib.parse
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+
 import requests
 
 BASE      = "https://discosweb.esoc.esa.int"
@@ -35,6 +34,10 @@ API_VER   = "2"
 PAGE_SIZE = 100          # JSON:API page size (DISCOS max is typically 100)
 BATCH     = 100          # SATNOs per request via in(satno,(...))
 BASE_SLEEP = 2.0         # polite delay between requests (DISCOS ~30 req/min)
+
+MAX_429_RETRIES  = 6     # per page, before giving up on the batch
+MAX_HTTP_RETRIES = 3     # transient 5xx / network errors, per page
+BACKOFF = [2, 8, 30]     # seconds, indexed by attempt
 
 FIELDS = ["satno","cosparId","name","objectClass",
           "mass_kg","xSectAvg_m2","radius_m","shape","found"]
@@ -57,6 +60,7 @@ def load_satnos(path):
 
 
 def load_cache(path):
+    """Last row per satno wins, so re-runs supersede earlier misses."""
     done = {}
     if os.path.exists(path):
         with open(path, newline="") as f:
@@ -66,6 +70,11 @@ def load_cache(path):
                 except (KeyError, ValueError, TypeError):
                     pass
     return done
+
+
+def cell(row, key):
+    """DictReader yields None for missing trailing fields on truncated rows."""
+    return (row.get(key) or "").strip()
 
 
 def radius_from_xsect(x):
@@ -78,23 +87,56 @@ def radius_from_xsect(x):
     return ""
 
 
+def parse_retry_after(value, default=60):
+    """Retry-After may be delta-seconds or an HTTP-date; tolerate both."""
+    if not value:
+        return default
+    try:
+        return max(1, min(int(float(value)), 300))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt is not None:
+            if dt.tzinfo is None:              # naive HTTP-date: RFC says GMT
+                dt = dt.replace(tzinfo=timezone.utc)
+            wait = int(dt.timestamp() - time.time())
+            return max(1, min(wait, 300))
+    except (TypeError, ValueError, IndexError):
+        pass
+    return default
+
+
 def throttle_from_headers(h):
     """Sleep if the rate-limit headers say we're near the cap."""
     rem   = h.get("X-RateLimit-Remaining") or h.get("RateLimit-Remaining")
     reset = h.get("X-RateLimit-Reset")     or h.get("RateLimit-Reset")
     try:
-        if rem is not None and int(rem) <= 1 and reset is not None:
-            r = int(reset)
+        if rem is not None and int(float(rem)) <= 1 and reset is not None:
+            r = int(float(reset))
             wait = r - int(time.time()) if r > 100000 else r   # epoch vs seconds
             wait = max(1, min(wait, 120))
             print(f"    quota low; sleeping {wait}s to reset")
             time.sleep(wait + 1)
-    except ValueError:
+    except (TypeError, ValueError):
         pass
 
 
-def fetch_batch(token, satnos):
-    """Return a list of attribute dicts for the given SATNOs."""
+def next_url(body):
+    """links.next may be a relative path or an absolute URL."""
+    nxt = (body.get("links") or {}).get("next")
+    if not nxt:
+        return None
+    return nxt if nxt.startswith("http") else BASE + nxt
+
+
+def fetch_batch(token, satnos, sleep=BASE_SLEEP):
+    """Return a list of attribute dicts for the given SATNOs.
+
+    Raises requests.RequestException if a page cannot be retrieved after
+    the retry budget is exhausted; the caller skips the batch and the
+    SATNOs stay uncached so a re-run picks them up.
+    """
     headers = {"Authorization": f"Bearer {token}", "DiscosWeb-Api-Version": API_VER}
     filt = "in(satno,({}))".format(",".join(str(s) for s in satnos))
     # Build the query manually: encode the filter value, leave page[...] literal.
@@ -102,29 +144,69 @@ def fetch_batch(token, satnos):
          f"&page[size]={PAGE_SIZE}&page[number]=1")
     url = ENDPOINT + q
     results = []
+
     while url:
-        resp = requests.get(url, headers=headers, timeout=60)
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", "60"))
-            print(f"    429 rate-limited; sleeping {wait}s")
-            time.sleep(wait + 1)
-            continue
-        if resp.status_code == 401:
-            sys.exit("401 Unauthorized -- check DISCOS_TOKEN (is it current?).")
-        resp.raise_for_status()
+        n429 = nerr = 0
+        while True:
+            try:
+                resp = requests.get(url, headers=headers, timeout=60)
+            except requests.RequestException as e:
+                if nerr >= MAX_HTTP_RETRIES:
+                    raise
+                wait = BACKOFF[min(nerr, len(BACKOFF) - 1)]
+                print(f"    network error ({e.__class__.__name__}); retry in {wait}s")
+                nerr += 1
+                time.sleep(wait)
+                continue
+
+            if resp.status_code == 401:
+                sys.exit("401 Unauthorized -- check DISCOS_TOKEN (is it current?).")
+
+            if resp.status_code == 429:
+                if n429 >= MAX_429_RETRIES:
+                    raise requests.HTTPError(
+                        f"429 persisted after {MAX_429_RETRIES} retries "
+                        "(daily quota exhausted?)", response=resp)
+                wait = parse_retry_after(resp.headers.get("Retry-After"))
+                n429 += 1
+                print(f"    429 rate-limited ({n429}/{MAX_429_RETRIES}); sleeping {wait}s")
+                time.sleep(wait + 1)
+                continue
+
+            if 500 <= resp.status_code < 600:
+                if nerr >= MAX_HTTP_RETRIES:
+                    resp.raise_for_status()
+                wait = BACKOFF[min(nerr, len(BACKOFF) - 1)]
+                print(f"    HTTP {resp.status_code}; retry in {wait}s")
+                nerr += 1
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            break
+
         body = resp.json()
         for item in body.get("data", []):
             results.append(item.get("attributes", {}))
         throttle_from_headers(resp.headers)
-        nxt = body.get("links", {}).get("next")
-        url = (BASE + nxt) if nxt else None
+        url = next_url(body)
+        if url:
+            time.sleep(sleep)      # pace pagination, not just batches
+
     return results
 
 
-def miss_row(satno):
-    row = {k: "" for k in FIELDS}
-    row["satno"], row["found"] = satno, 0
-    return row
+def compact(path):
+    """Rewrite the cache deduplicated, last row per satno."""
+    cache = load_cache(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=FIELDS)
+        w.writeheader()
+        for sn in sorted(cache):
+            w.writerow({k: cache[sn].get(k, "") for k in FIELDS})
+    os.replace(tmp, path)
+    print(f"Compacted {path}: {len(cache)} unique SATNOs")
 
 
 def main():
@@ -133,6 +215,10 @@ def main():
     ap.add_argument("--out", default="discos_cache.csv")
     ap.add_argument("--sleep", type=float, default=BASE_SLEEP)
     ap.add_argument("--limit", type=int, default=0, help="fetch only first N (smoke test)")
+    ap.add_argument("--retry-misses", action="store_true",
+                    help="re-fetch SATNOs previously recorded as found=0")
+    ap.add_argument("--compact", action="store_true",
+                    help="rewrite the cache deduplicated before summarizing")
     args = ap.parse_args()
 
     token = os.environ.get("DISCOS_TOKEN")
@@ -141,69 +227,97 @@ def main():
 
     satnos = load_satnos(args.satnos)
     cache  = load_cache(args.out)
-    todo   = [s for s in satnos if s not in cache]
-    if args.limit:
+
+    if args.retry_misses:
+        skip = {s for s, r in cache.items() if cell(r, "found") == "1"}
+        n_retry = sum(1 for s in satnos if s in cache and s not in skip)
+        print(f"--retry-misses: re-fetching {n_retry} previously-missing SATNOs")
+    else:
+        skip = set(cache)
+
+    todo = [s for s in satnos if s not in skip]
+    if args.limit > 0:
         todo = todo[:args.limit]
     print(f"Requested: {len(satnos)} | already cached: {len(cache)} | to fetch: {len(todo)}")
     if not todo:
         print("Nothing to fetch. Cache is complete.")
+        if args.compact:
+            compact(args.out)
         summarize(args.out)
         return
 
-    new_file = not os.path.exists(args.out)
+    # An existing but empty file (crash before the header write) still needs one.
+    need_header = (not os.path.exists(args.out)) or os.path.getsize(args.out) == 0
     with open(args.out, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=FIELDS)
-        if new_file:
+        if need_header:
             w.writeheader()
         nbatches = -(-len(todo) // BATCH)
         for bi in range(0, len(todo), BATCH):
             batch = todo[bi:bi + BATCH]
             print(f"batch {bi//BATCH + 1}/{nbatches}: {len(batch)} satnos")
             try:
-                attrs = fetch_batch(token, batch)
-            except requests.HTTPError as e:
-                print(f"  HTTP error: {e}; skipping this batch (rerun to retry)")
+                attrs = fetch_batch(token, batch, sleep=args.sleep)
+            except requests.RequestException as e:
+                r = getattr(e, "response", None)
+                if r is not None and r.status_code == 429:
+                    # No point burning MAX_429_RETRIES on every remaining batch:
+                    # a persistent 429 means the quota is gone for everyone.
+                    sys.exit("  429 persisted through retries -- daily quota likely "
+                             "exhausted. Progress so far is cached; re-run later "
+                             "to resume.")
+                print(f"  request failed: {e}; skipping this batch (rerun to retry)")
+                time.sleep(args.sleep)         # stay polite even on the failure path
                 continue
-            got = {}
+            got = set()
             for a in attrs:
                 sn = a.get("satno")
                 if sn is None:
                     continue
-                sn = int(sn)
-                got[sn] = True
+                try:
+                    sn = int(sn)
+                except (TypeError, ValueError):
+                    continue
+                got.add(sn)
                 w.writerow({
                     "satno": sn,
-                    "cosparId": a.get("cosparId", ""),
-                    "name": a.get("name", ""),
-                    "objectClass": a.get("objectClass", ""),
-                    "mass_kg": a.get("mass", "") if a.get("mass") is not None else "",
-                    "xSectAvg_m2": a.get("xSectAvg", "") if a.get("xSectAvg") is not None else "",
+                    "cosparId": a.get("cosparId") or "",
+                    "name": a.get("name") or "",
+                    "objectClass": a.get("objectClass") or "",
+                    "mass_kg": a.get("mass") if a.get("mass") is not None else "",
+                    "xSectAvg_m2": a.get("xSectAvg") if a.get("xSectAvg") is not None else "",
                     "radius_m": radius_from_xsect(a.get("xSectAvg")),
-                    "shape": a.get("shape", ""),
+                    "shape": a.get("shape") or "",
                     "found": 1,
                 })
             for sn in batch:                      # record misses so we don't refetch
                 if sn not in got:
-                    w.writerow(miss_row(sn))
-            fh.flush()                            # incremental durability
+                    w.writerow({**{k: "" for k in FIELDS}, "satno": sn, "found": 0})
+            fh.flush()
+            os.fsync(fh.fileno())                 # incremental durability
             time.sleep(args.sleep)
 
+    if args.compact:
+        compact(args.out)
     summarize(args.out)
 
 
 def summarize(path):
-    n = found = withmass = 0
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            n += 1
-            if row.get("found") == "1":
-                found += 1
-                if row.get("mass_kg", "").strip():
-                    withmass += 1
+    cache = load_cache(path)          # deduplicated: last row per satno wins
+    n = len(cache)
+    found = withmass = withxsect = 0
+    for row in cache.values():
+        if cell(row, "found") == "1":
+            found += 1
+            if cell(row, "mass_kg"):
+                withmass += 1
+            if cell(row, "xSectAvg_m2"):
+                withxsect += 1
     print("\n=== DISCOS pull summary ===")
     print(f"  cached SATNOs        : {n}")
     print(f"  found in DISCOS      : {found} ({pct(found,n)})")
     print(f"  ...with a mass value : {withmass} ({pct(withmass,n)})  <- usable for sizing")
+    print(f"  ...with a xSect value: {withxsect} ({pct(withxsect,n)})")
     print(f"  missing / no mass    : {n - withmass} ({pct(n-withmass,n)})  <- need fallback rule")
 
 
