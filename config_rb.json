@@ -3,15 +3,15 @@
   "id": "1",
   "owner": "Daniel Chen",
   "description": "This is a simulation file with rocket bodies as a species",
-  "created": "2026-07-011",
-  "modified": "2026-07-011",
+  "created": "2026-07-11",
+  "modified": "2026-07-26",
   "scenario_properties": {
     "start_date": "01/01/2026",
     "simulation_duration": 100,
     "steps": 101,
     "min_altitude": 200,
-    "max_altitude": 1400,
-    "n_shells": 24,
+    "max_altitude": 2000,
+    "n_shells": 36,
     "launch_function": "Constant",
     "integrator": "BDF",
     "density_model": "static_exp_dens_func",
@@ -20,20 +20,8 @@
     "fragment_spreading": true,
     "parallel_processing": false,
     "baseline": false,
-    "launch_scenario": "SEP2",
     "indicator_variables": ["umpy"]
   },
-  "plots": [
-    "total_objects_over_time",
-    "indicator_variables"
-  ],
-  "SEP_mapping": [
-    "T.loc[(T['obj_type'] == 2) &  (T['obj_type'] == 2) & (T['maneuverable'] == 1), 'species_class'] = 'Su'",
-    "T.loc[(T['phase'] == 2) & (T['obj_type'] == 2) & (T['maneuverable'] == 1) & (T['const_name'].notna()), 'species_class'] = 'S'",
-    "T.loc[(T['obj_type'] == 2) & (T['mass'] <= 20) & (T['phase'] == 2), 'species_class'] = 'Sns'",
-    "T.loc[(T['obj_type'] >= 3) & (T['mass'] >= 0.03), 'species_class'] = 'N'",
-    "T.loc[(T['obj_type'] == 1), 'species_class'] = 'B'"
-  ],
   "species": [
     {
       "sym_name": "S",

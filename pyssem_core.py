@@ -104,9 +104,13 @@ def _rb_stage_properties(cfg):
             continue
         if callable(prof):
             rate = np.maximum(0.0, np.asarray(prof(t), float))
+            rate = np.broadcast_to(rate, t.shape)    # constant lambdas return 0-d
         else:
             a = np.asarray(prof, float)
-            rate = np.maximum(0.0, np.interp(t, np.linspace(t[0], t[-1], len(a)), a))
+            # index i = year i, held flat after the last -- MUST match
+            # set_launches.to_rate, or the same profile means two different
+            # things to the launch schedule and the RB flux weighting.
+            rate = np.maximum(0.0, np.interp(t, np.arange(len(a)), a))
         vol[b] += float(np.trapezoid(rate, t)) if hasattr(np, "trapezoid") \
             else float(np.trapz(rate, t))
 
@@ -270,7 +274,8 @@ def set_launches(model, cfg):
 
     def to_rate(profile):
         if callable(profile):
-            return np.maximum(0.0, np.asarray(profile(t), float))
+            r = np.maximum(0.0, np.asarray(profile(t), float))
+            return np.broadcast_to(r, t.shape)       # constant lambdas return 0-d
         a = np.asarray(profile, float)
         return np.maximum(0.0, np.interp(t, np.arange(len(a)), a))
 
