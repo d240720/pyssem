@@ -16,7 +16,6 @@ USAGE: python3 export_intact_satnos.py [--gp 2026.csv] [--out intact_satnos.csv]
 
 import argparse
 
-import numpy as np
 import pandas as pd
 
 TYPES = ("PAYLOAD", "ROCKET BODY")
@@ -32,33 +31,31 @@ def main():
                     help="emit a 'satno' header row (default: headerless, as MATLAB)")
     a = ap.parse_args()
 
-    gp = pd.read_csv(a.gp, low_memory=False)
+    gp = pd.read_csv(a.gp, usecols=["NORAD_CAT_ID", "OBJECT_TYPE"])
 
     otype = gp["OBJECT_TYPE"].astype("string").str.strip().str.upper()
-    sel = otype.isin(TYPES)
+    intact = otype.isin(TYPES)
 
-    satnos = pd.to_numeric(gp.loc[sel, "NORAD_CAT_ID"], errors="coerce")
-    satnos = satnos[np.isfinite(satnos) & (satnos > 0)]        # drop blank/invalid IDs
-    satnos = np.unique(np.round(satnos).astype(np.int64))
+    satnos = pd.to_numeric(gp.loc[intact, "NORAD_CAT_ID"], errors="coerce")
+    satnos = satnos.dropna().round().astype("int64")
+    satnos = satnos[satnos > 0].drop_duplicates().sort_values()
 
     n_all = len(satnos)
     if a.max_norad is not None:
         satnos = satnos[satnos <= a.max_norad]
 
-    pd.Series(satnos, name="satno").to_csv(a.out, index=False, header=a.header)
+    satnos.rename("satno").to_csv(a.out, index=False, header=a.header)
 
-    n_pay = int((otype == "PAYLOAD").sum())
-    n_rb = int((otype == "ROCKET BODY").sum())
-    print(f"Wrote {len(satnos)} unique SATNOs ({n_pay} payloads + {n_rb} rocket bodies "
-          f"requested) to {a.out}")
+    n_pay = int((otype[intact] == "PAYLOAD").sum())
+    n_rb = int((otype[intact] == "ROCKET BODY").sum())
+    print(f"Wrote {len(satnos)} unique SATNOs to {a.out} "
+          f"(from {n_pay} payload + {n_rb} rocket-body rows)")
+    if invalid := int(intact.sum()) - n_all:
+        print(f"  {invalid} row(s) had blank/invalid/duplicate IDs")
     if a.max_norad is not None and n_all != len(satnos):
         print(f"  dropped {n_all - len(satnos)} IDs above --max-norad {a.max_norad}")
     if len(satnos):
         print(f"  ID range: {satnos.min()} to {satnos.max()}")
-        n_big = int((satnos > 80000).sum())
-        if n_big:
-            print(f"  NOTE: {n_big} IDs exceed 80000 "
-                  f"({int((satnos >= 100000).sum())} are 6-digit).")
 
 
 if __name__ == "__main__":

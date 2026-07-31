@@ -2,7 +2,7 @@
 """
 fetch_catalogs.py
 
-Reproducible, dated fetch of the source catalogs.
+Dated fetch of the source catalogs.
 
   2026.csv    Space-Track GP snapshot of the on-orbit LEO-region catalog.
               Predicates: DECAY_DATE=null, MEAN_MOTION>3, ordered by NORAD_CAT_ID.
@@ -63,28 +63,6 @@ def sha256(path):
     return h.hexdigest()
 
 
-def read_header(path):
-    """First row of a CSV, quote/CRLF tolerant."""
-    with open(path, newline="", encoding="utf-8", errors="replace") as f:
-        try:
-            return next(csv.reader(f))
-        except StopIteration:
-            return []
-
-
-def verify_columns(path, required, either=()):
-    """Raise if the CSV is missing any required column."""
-    header = [c.strip().lstrip("\ufeff") for c in read_header(path)]
-    missing = [c for c in required if c not in header]
-    if either and not any(c in header for c in either):
-        missing.append("/".join(either))
-    if missing:
-        raise ValueError(
-            f"{path}: missing column(s) {missing}\n  header was: {header[:12]}"
-            f"{' ...' if len(header) > 12 else ''}")
-    return header
-
-
 def count_rows(path):
     """Data rows (excludes the header). CSV-aware: quoted fields with embedded
     newlines (occasional in SATCAT names) count as one row, not two."""
@@ -93,44 +71,37 @@ def count_rows(path):
     return max(0, n - 1)
 
 
-def norad_count(path, predicate):
-    """Rows whose NORAD_CAT_ID satisfies `predicate`."""
+def verify_columns(path, required, either=()):
+    """Raise if the CSV is missing any required column."""
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
-        r = csv.DictReader(f)
-        if "NORAD_CAT_ID" not in (r.fieldnames or []):
-            return 0
-        c = 0
-        for row in r:
-            try:
-                if predicate(int(float(row["NORAD_CAT_ID"]))):
-                    c += 1
-            except (TypeError, ValueError):
-                continue
-    return c
-
-
-def download(session, url, dest_tmp, **kw):
-    """Stream a URL to a temp path. Raises on any non-2xx."""
-    with session.get(url, stream=True, timeout=300, **kw) as resp:
-        resp.raise_for_status()
-        with open(dest_tmp, "wb") as f:
-            for chunk in resp.iter_content(1 << 20):
-                f.write(chunk)
+        header = next(csv.reader(f), [])
+    header = [c.strip().lstrip("\ufeff") for c in header]
+    missing = [c for c in required if c not in header]
+    if either and not any(c in header for c in either):
+        missing.append("/".join(either))
+    if missing:
+        raise ValueError(
+            f"{path}: missing column(s) {missing}\n  header was: {header[:12]}"
+            f"{' ...' if len(header) > 12 else ''}")
 
 
 def fetch(session, url, final_path, required, either=()):
-    """Download -> verify -> atomically move into place. A failed or malformed
-    download never overwrites the existing file."""
-    fd, tmp = tempfile.mkstemp(prefix=".fetch_", dir=str(final_path.parent))
-    os.close(fd)
+    """Stream URL -> temp file -> verify -> atomically move into place. A failed
+    or malformed download never overwrites the existing file."""
+    with tempfile.NamedTemporaryFile(prefix=".fetch_", dir=str(final_path.parent),
+                                     delete=False) as tf:
+        tmp = tf.name
     try:
-        download(session, url, tmp)
+        with session.get(url, stream=True, timeout=300) as resp:
+            resp.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(1 << 20):
+                    f.write(chunk)
         verify_columns(tmp, required, either)
         shutil.move(tmp, final_path)          # only now do we clobber
     except Exception:
         Path(tmp).unlink(missing_ok=True)
         raise
-    return final_path
 
 
 def archive_and_record(path, snapdir, manifest, source, query, fetched_utc):
@@ -151,30 +122,33 @@ def archive_and_record(path, snapdir, manifest, source, query, fetched_utc):
         w.writerow([fetched_utc, path.name, source, rows, sha, query])
 
     print(f"  rows={rows}  sha256={sha[:12]}...  archived -> {snap}")
-    return rows
+
+
+def new_session():
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
+    return s
 
 
 def space_track_session(outdir):
     """Authenticated Space-Track session. Credentials from env or space_track.env."""
-    env = Path(__file__).resolve().parent / "space_track.env"
-    if not env.exists():
-        env = outdir / "space_track.env"
-
     from_shell = bool(os.environ.get("ST_USER") and os.environ.get("ST_PASS"))
-    if env.exists():
-        for line in env.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+    for env in (Path(__file__).resolve().parent / "space_track.env",
+                outdir / "space_track.env"):
+        if env.exists():
+            for line in env.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+            break
 
     user, pw = os.environ.get("ST_USER"), os.environ.get("ST_PASS")
     if not user or not pw:
         sys.exit("Set ST_USER and ST_PASS (env or space_track.env) for Space-Track.")
     print(f"  credentials from {'shell env (overrides space_track.env)' if from_shell else env}")
 
-    s = requests.Session()
-    s.headers["User-Agent"] = UA
+    s = new_session()
     print("  authenticating to Space-Track...")
     r = s.post(f"{ST_BASE}/ajaxauth/login",
                data={"identity": user, "password": pw}, timeout=60)
@@ -200,51 +174,39 @@ def main():
 
     outdir = Path(a.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    
+
     snapdir = outdir / "catalog_snapshots"
     manifest = snapdir / "MANIFEST.tsv"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    do_gp = not a.satcat_only
-    do_satcat = not a.gp_only
     st = None
 
     # ---- 1) Space-Track GP -> 2026.csv --------------------------------------
-    if do_gp:
+    if not a.satcat_only:
         gp_path = outdir / a.gp_name
         print(f"[1/2] Space-Track GP on-orbit LEO-region catalog -> {gp_path}")
-        
+
         st = space_track_session(outdir)
         print("  querying GP catalog...")
         try:
             fetch(st, ST_BASE + GP_QUERY, gp_path, GP_REQUIRED)
         except (requests.RequestException, ValueError) as e:
             sys.exit(f"  GP fetch failed: {e}\n  (existing {gp_path} left untouched)")
-        
-        archive_and_record(gp_path, snapdir, manifest, "space-track:gp", GP_QUERY, now)
 
-        total = count_rows(gp_path)
-        kept = norad_count(gp_path, lambda n: n <= 80000)
-        big6 = norad_count(gp_path, lambda n: n >= 100000)
-        print(f"  total={total}  kept(<=80000)={kept}  "
-              f"(original June-2026 snapshot: 30086 -> 29039)")
-        if big6:
-            print(f"  NOTE: {big6} objects have 6-digit NORAD IDs;")
+        archive_and_record(gp_path, snapdir, manifest, "space-track:gp", GP_QUERY, now)
     else:
         print("[1/2] skipped GP (--satcat-only)")
 
     # ---- 2) SATCAT ----------------------------------------------------------
-    if do_satcat:
+    if not a.gp_only:
         sc_path = outdir / "satcat.csv"
         if a.satcat_spacetrack:
             print(f"[2/2] Space-Track SATCAT -> {sc_path}")
-            st = st or space_track_session(outdir)
+            sess = st or space_track_session(outdir)
             url, label, ref = ST_BASE + SATCAT_QUERY, "space-track:satcat", SATCAT_QUERY
-            sess = st
         else:
             print(f"[2/2] CelesTrak SATCAT -> {sc_path}")
-            sess = requests.Session()
-            sess.headers["User-Agent"] = UA
+            sess = new_session()
             url, label, ref = CELESTRAK_URL, "celestrak:satcat", CELESTRAK_URL
 
         try:
@@ -253,12 +215,6 @@ def main():
             sys.exit(f"  SATCAT fetch failed: {e}\n"
                      f"  (CelesTrak anti-bot? try --satcat-spacetrack)")
         archive_and_record(sc_path, snapdir, manifest, label, ref, now)
-
-        bignum = norad_count(sc_path, lambda n: n >= 100000)
-        if bignum:
-            print(f"  WARNING: satcat.csv has {bignum} objects with 6-digit catalog "
-                  f"numbers (>=100000); the >80000 temp-ID filter in the build scripts "
-                  f"will discard these. Revisit that threshold before regenerating.")
     else:
         print("[2/2] skipped SATCAT (--gp-only)")
 

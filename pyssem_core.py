@@ -68,6 +68,19 @@ def _load_rb_injection(path):
     return inj
 
 
+def _profile_to_rate(profile, t):
+    """Launch profile -> nonnegative rate on grid t. Callables are evaluated
+    (constant lambdas broadcast from 0-d); array-likes are year-indexed
+    (index i = year i), linearly interpolated, held flat after the last entry.
+    Single definition shared by set_launches and the RB flux weighting so the
+    same profile can never mean two different things to the two consumers."""
+    if callable(profile):
+        r = np.maximum(0.0, np.asarray(profile(t), float))
+        return np.broadcast_to(r, t.shape)
+    a = np.asarray(profile, float)
+    return np.maximum(0.0, np.interp(t, np.arange(len(a)), a))
+
+
 def _band_of_factory(bands):
     def band_of(alt):
         for i, (lo, hi) in enumerate(bands):
@@ -77,7 +90,7 @@ def _band_of_factory(bands):
     return band_of
 
 
-def _rb_stage_properties(cfg):
+def _rb_stage_properties(cfg, years, steps, active_names=None):
     """Collapse the per-band stage mass/radius vectors to the single (mass, radius)
     that pyssem's one-RB-species model can represent, weighted by the stage flux this
     scenario's launch schedule will actually deposit in each band.
@@ -95,22 +108,17 @@ def _rb_stage_properties(cfg):
     nb = len(bands)
 
     # Payload volume launched into each band over the run (arbitrary common units --
-    # only the relative weights matter).
-    t = np.linspace(0.0, float(cfg.get("years", 100)), int(cfg.get("steps", 200)))
+    # only the relative weights matter). Uses the sim's own horizon and only
+    # launches that set_launches will actually schedule (active species).
+    t = np.linspace(0.0, float(years), int(steps))
     vol = np.zeros(nb)
-    for _sym, alt, prof in cfg.get("launches", []):
+    for sym, alt, prof in cfg.get("launches", []):
+        if active_names is not None and sym not in active_names:
+            continue
         b = band_of(alt)
         if b < 0:
             continue
-        if callable(prof):
-            rate = np.maximum(0.0, np.asarray(prof(t), float))
-            rate = np.broadcast_to(rate, t.shape)    # constant lambdas return 0-d
-        else:
-            a = np.asarray(prof, float)
-            # index i = year i, held flat after the last -- MUST match
-            # set_launches.to_rate, or the same profile means two different
-            # things to the launch schedule and the RB flux weighting.
-            rate = np.maximum(0.0, np.interp(t, np.arange(len(a)), a))
+        rate = _profile_to_rate(prof, t)
         vol[b] += float(np.trapezoid(rate, t)) if hasattr(np, "trapezoid") \
             else float(np.trapz(rate, t))
 
@@ -160,7 +168,10 @@ def _apply_rb_species_params(conf, cfg):
     symbolic equations. Explicit CONFIG values (rb_mass / rb_radius) win."""
     if not cfg.get("rb_injection"):
         return
-    mass, radius, w, inj = _rb_stage_properties(cfg)
+    sp = conf["scenario_properties"]            # post-override values
+    active_names = {s["sym_name"] for s in conf["species"] if s.get("active")}
+    mass, radius, w, inj = _rb_stage_properties(
+        cfg, sp.get("simulation_duration", 100), sp.get("steps", 200), active_names)
     mass = cfg.get("rb_mass") if cfg.get("rb_mass") is not None else mass
     radius = cfg.get("rb_radius") if cfg.get("rb_radius") is not None else radius
 
@@ -189,11 +200,7 @@ def _apply_ic(x0, cfg, HMid):
     bands = cfg.get("ic_bands")
     shell_band = None
     if bands:
-        def band_of(a):
-            for i, (lo, hi) in enumerate(bands):
-                if lo <= a < hi:
-                    return i
-            return -1
+        band_of = _band_of_factory(bands)
         shell_band = np.array([band_of(h) for h in HMid])
 
     for sp, f in cfg.get("ic_scale", {}).items():
@@ -249,7 +256,8 @@ def build_model(cfg):
     def _seed(self, baseline=False, launch_file=None):
         if cfg["seed_from_catalog"]:
             self.x0 = build_x0(self, gp_path=cfg["gp"], satcat_path=cfg["satcat"],
-                               discos_path=cfg["discos"], verbose=False)
+                               discos_path=cfg["discos"],
+                               ecc_policy=cfg.get("ecc_policy", "mean"), verbose=False)
         else:
             import pandas as pd
             self.x0 = pd.DataFrame(np.zeros((self.n_shells, len(self.species_names))),
@@ -273,11 +281,7 @@ def set_launches(model, cfg):
     n = scen.n_shells
 
     def to_rate(profile):
-        if callable(profile):
-            r = np.maximum(0.0, np.asarray(profile(t), float))
-            return np.broadcast_to(r, t.shape)       # constant lambdas return 0-d
-        a = np.asarray(profile, float)
-        return np.maximum(0.0, np.interp(t, np.arange(len(a)), a))
+        return _profile_to_rate(profile, t)
 
     def shell_for(alt):
         return int(np.argmin(np.abs(HMid - alt)))
@@ -313,12 +317,33 @@ def _apply_rb_injection(scen, path, by, active, t, HMid, n):
 
     shell_band = np.array([band_of(h) for h in HMid])
     in_band = {b: np.where(shell_band == b)[0] for b in range(len(bands))}
+    empty = [bp for bp in range(len(bands))
+             if len(in_band[bp]) == 0 and R_band[:, bp].any()]
+    if empty:
+        print(f"  warning: rb_injection destination band(s) "
+              f"{[tuple(bands[bp]) for bp in empty]} contain no shells in this "
+              f"grid; their stage rates are dropped")
 
     S_rate = np.zeros((n, len(t)))
     for sym in active:
         for k, arr in enumerate(by.get(sym, [None] * n)):
             if arr is not None:
                 S_rate[k] += arr
+
+    n_unbanded = sum(1 for k in range(n)
+                     if shell_band[k] < 0 and S_rate[k].any())
+    if n_unbanded:
+        print(f"  warning: {n_unbanded} shell(s) with launches lie outside all "
+              f"rb_injection bands; those launches generate no stages")
+    suppressed = set(inj.get("suppressed_payload_bands", []))
+    hit = sorted({int(shell_band[k]) for k in range(n)
+                  if shell_band[k] in suppressed and S_rate[k].any()})
+    if hit:
+        print(f"  warning: launches target payload band(s) "
+              f"{[tuple(bands[b]) for b in hit]} whose R_persat row was "
+              f"SUPPRESSED at build time (too few catalog payloads); those "
+              f"launches generate no stages -- rebuild rb_injection with a "
+              f"lower --min-payloads or accept the zero")
 
     B_rate = np.zeros((n, len(t)))
     for k in range(n):
@@ -366,6 +391,13 @@ def collision_probability(scen, avoidance=True):
     if v_imp.ndim == 0:
         v_imp = np.full(n, float(v_imp))
     M2KM, SEC = 1e-3, 86400.0 * 365.25
+
+    unset = [s.sym_name for g in scen.species.values() for s in g
+             if getattr(s, "maneuverable", False)
+             and (s.alpha is None or s.alpha_active is None)]
+    if avoidance and unset:
+        print(f"  warning: maneuverable species {unset} have alpha/alpha_active="
+              f"None -> treated as 0 (perfect avoidance) in reported probabilities")
 
     info, active = {}, []
     for g in scen.species.values():
@@ -457,6 +489,7 @@ def plot_results(results, outdir="."):
     fig.suptitle("Population over time by species")
     fig.tight_layout()
     fig.savefig(f"{od}/population_over_time.png", dpi=130)
+    plt.close(fig)
 
     for S, p in prob.items():
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -469,6 +502,7 @@ def plot_results(results, outdir="."):
         fig.colorbar(mesh, ax=ax, label="collisions / sat / yr")
         fig.tight_layout()
         fig.savefig(f"{od}/collision_prob_{S}.png", dpi=130)
+        plt.close(fig)
     print(f"Wrote figures to {od}/")
 
 

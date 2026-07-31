@@ -22,7 +22,13 @@ Notes:
     re-fetched -- delete those rows (or the cache) if DISCOS may have gained data.
 """
 
-import os, sys, csv, time, math, argparse, urllib.parse
+import argparse
+import csv
+import math
+import os
+import sys
+import time
+import urllib.parse
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 
@@ -39,8 +45,8 @@ MAX_429_RETRIES  = 6     # per page, before giving up on the batch
 MAX_HTTP_RETRIES = 3     # transient 5xx / network errors, per page
 BACKOFF = [2, 8, 30]     # seconds, indexed by attempt
 
-FIELDS = ["satno","cosparId","name","objectClass",
-          "mass_kg","xSectAvg_m2","radius_m","shape","found"]
+FIELDS = ["satno", "cosparId", "name", "objectClass",
+          "mass_kg", "xSectAvg_m2", "radius_m", "shape", "found"]
 
 
 def load_satnos(path):
@@ -48,14 +54,13 @@ def load_satnos(path):
     with open(path, newline="") as f:
         for line in f:
             s = line.strip().strip(",").strip('"')
-            if not s:
-                continue
             try:
                 v = int(float(s))
             except ValueError:
-                continue          # header or junk line
+                continue          # blank, header, or junk line
             if v > 0 and v not in seen:
-                seen.add(v); out.append(v)
+                seen.add(v)
+                out.append(v)
     return out
 
 
@@ -97,14 +102,11 @@ def parse_retry_after(value, default=60):
         pass
     try:
         dt = parsedate_to_datetime(value)
-        if dt is not None:
-            if dt.tzinfo is None:              # naive HTTP-date: RFC says GMT
-                dt = dt.replace(tzinfo=timezone.utc)
-            wait = int(dt.timestamp() - time.time())
-            return max(1, min(wait, 300))
+        if dt.tzinfo is None:                  # naive HTTP-date: RFC says GMT
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(1, min(int(dt.timestamp() - time.time()), 300))
     except (TypeError, ValueError, IndexError):
-        pass
-    return default
+        return default
 
 
 def throttle_from_headers(h):
@@ -122,77 +124,67 @@ def throttle_from_headers(h):
         pass
 
 
-def next_url(body):
-    """links.next may be a relative path or an absolute URL."""
-    nxt = (body.get("links") or {}).get("next")
-    if not nxt:
-        return None
-    return nxt if nxt.startswith("http") else BASE + nxt
+def get_with_retries(session, url):
+    """GET one page. Transient network errors and 5xx share a backoff budget;
+    429 honors Retry-After up to MAX_429_RETRIES; 401 exits with a hint.
+    Raises requests.RequestException once the relevant budget is exhausted."""
+    n429 = nerr = 0
+    while True:
+        try:
+            resp = session.get(url, timeout=60)
+        except requests.RequestException as e:
+            if nerr >= MAX_HTTP_RETRIES:
+                raise
+            wait = BACKOFF[min(nerr, len(BACKOFF) - 1)]
+            print(f"    network error ({e.__class__.__name__}); retry in {wait}s")
+            nerr += 1
+            time.sleep(wait)
+            continue
+
+        if resp.status_code == 401:
+            sys.exit("401 Unauthorized -- check DISCOS_TOKEN (is it current?).")
+
+        if resp.status_code == 429:
+            if n429 >= MAX_429_RETRIES:
+                raise requests.HTTPError(
+                    f"429 persisted after {MAX_429_RETRIES} retries "
+                    "(daily quota exhausted?)", response=resp)
+            wait = parse_retry_after(resp.headers.get("Retry-After"))
+            n429 += 1
+            print(f"    429 rate-limited ({n429}/{MAX_429_RETRIES}); sleeping {wait}s")
+            time.sleep(wait + 1)
+            continue
+
+        if 500 <= resp.status_code < 600:
+            if nerr >= MAX_HTTP_RETRIES:
+                resp.raise_for_status()
+            wait = BACKOFF[min(nerr, len(BACKOFF) - 1)]
+            print(f"    HTTP {resp.status_code}; retry in {wait}s")
+            nerr += 1
+            time.sleep(wait)
+            continue
+
+        resp.raise_for_status()
+        return resp
 
 
-def fetch_batch(token, satnos, sleep=BASE_SLEEP):
-    """Return a list of attribute dicts for the given SATNOs.
-
-    Raises requests.RequestException if a page cannot be retrieved after
-    the retry budget is exhausted; the caller skips the batch and the
-    SATNOs stay uncached so a re-run picks them up.
-    """
-    headers = {"Authorization": f"Bearer {token}", "DiscosWeb-Api-Version": API_VER}
+def fetch_batch(session, satnos, sleep=BASE_SLEEP):
+    """Attribute dicts for the given SATNOs, following JSON:API pagination.
+    Raises requests.RequestException if a page cannot be retrieved; the caller
+    skips the batch and the SATNOs stay uncached so a re-run picks them up."""
     filt = "in(satno,({}))".format(",".join(str(s) for s in satnos))
     # Build the query manually: encode the filter value, leave page[...] literal.
-    q = (f"?filter={urllib.parse.quote(filt)}"
-         f"&page[size]={PAGE_SIZE}&page[number]=1")
-    url = ENDPOINT + q
+    url = f"{ENDPOINT}?filter={urllib.parse.quote(filt)}&page[size]={PAGE_SIZE}&page[number]=1"
     results = []
-
     while url:
-        n429 = nerr = 0
-        while True:
-            try:
-                resp = requests.get(url, headers=headers, timeout=60)
-            except requests.RequestException as e:
-                if nerr >= MAX_HTTP_RETRIES:
-                    raise
-                wait = BACKOFF[min(nerr, len(BACKOFF) - 1)]
-                print(f"    network error ({e.__class__.__name__}); retry in {wait}s")
-                nerr += 1
-                time.sleep(wait)
-                continue
-
-            if resp.status_code == 401:
-                sys.exit("401 Unauthorized -- check DISCOS_TOKEN (is it current?).")
-
-            if resp.status_code == 429:
-                if n429 >= MAX_429_RETRIES:
-                    raise requests.HTTPError(
-                        f"429 persisted after {MAX_429_RETRIES} retries "
-                        "(daily quota exhausted?)", response=resp)
-                wait = parse_retry_after(resp.headers.get("Retry-After"))
-                n429 += 1
-                print(f"    429 rate-limited ({n429}/{MAX_429_RETRIES}); sleeping {wait}s")
-                time.sleep(wait + 1)
-                continue
-
-            if 500 <= resp.status_code < 600:
-                if nerr >= MAX_HTTP_RETRIES:
-                    resp.raise_for_status()
-                wait = BACKOFF[min(nerr, len(BACKOFF) - 1)]
-                print(f"    HTTP {resp.status_code}; retry in {wait}s")
-                nerr += 1
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-            break
-
+        resp = get_with_retries(session, url)
         body = resp.json()
-        for item in body.get("data", []):
-            results.append(item.get("attributes", {}))
+        results += [item.get("attributes", {}) for item in body.get("data", [])]
         throttle_from_headers(resp.headers)
-        url = next_url(body)
+        nxt = (body.get("links") or {}).get("next")
+        url = nxt and (nxt if nxt.startswith("http") else BASE + nxt)
         if url:
             time.sleep(sleep)      # pace pagination, not just batches
-
     return results
 
 
@@ -201,7 +193,7 @@ def compact(path):
     cache = load_cache(path)
     tmp = path + ".tmp"
     with open(tmp, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=FIELDS)
+        w = csv.DictWriter(fh, fieldnames=FIELDS, restval="")
         w.writeheader()
         for sn in sorted(cache):
             w.writerow({k: cache[sn].get(k, "") for k in FIELDS})
@@ -224,6 +216,10 @@ def main():
     token = os.environ.get("DISCOS_TOKEN")
     if not token:
         sys.exit("Set DISCOS_TOKEN to your DISCOSweb API token first.")
+
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {token}",
+                            "DiscosWeb-Api-Version": API_VER})
 
     satnos = load_satnos(args.satnos)
     cache  = load_cache(args.out)
@@ -249,15 +245,15 @@ def main():
     # An existing but empty file (crash before the header write) still needs one.
     need_header = (not os.path.exists(args.out)) or os.path.getsize(args.out) == 0
     with open(args.out, "a", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=FIELDS)
+        w = csv.DictWriter(fh, fieldnames=FIELDS, restval="")
         if need_header:
             w.writeheader()
-        nbatches = -(-len(todo) // BATCH)
+        nbatches = math.ceil(len(todo) / BATCH)
         for bi in range(0, len(todo), BATCH):
             batch = todo[bi:bi + BATCH]
             print(f"batch {bi//BATCH + 1}/{nbatches}: {len(batch)} satnos")
             try:
-                attrs = fetch_batch(token, batch, sleep=args.sleep)
+                attrs = fetch_batch(session, batch, sleep=args.sleep)
             except requests.RequestException as e:
                 r = getattr(e, "response", None)
                 if r is not None and r.status_code == 429:
@@ -269,13 +265,11 @@ def main():
                 print(f"  request failed: {e}; skipping this batch (rerun to retry)")
                 time.sleep(args.sleep)         # stay polite even on the failure path
                 continue
+
             got = set()
             for a in attrs:
-                sn = a.get("satno")
-                if sn is None:
-                    continue
                 try:
-                    sn = int(sn)
+                    sn = int(a.get("satno"))
                 except (TypeError, ValueError):
                     continue
                 got.add(sn)
@@ -284,15 +278,16 @@ def main():
                     "cosparId": a.get("cosparId") or "",
                     "name": a.get("name") or "",
                     "objectClass": a.get("objectClass") or "",
-                    "mass_kg": a.get("mass") if a.get("mass") is not None else "",
-                    "xSectAvg_m2": a.get("xSectAvg") if a.get("xSectAvg") is not None else "",
+                    # is-not-None (not `or`) so a genuine 0 survives as 0
+                    "mass_kg": a["mass"] if a.get("mass") is not None else "",
+                    "xSectAvg_m2": a["xSectAvg"] if a.get("xSectAvg") is not None else "",
                     "radius_m": radius_from_xsect(a.get("xSectAvg")),
                     "shape": a.get("shape") or "",
                     "found": 1,
                 })
             for sn in batch:                      # record misses so we don't refetch
                 if sn not in got:
-                    w.writerow({**{k: "" for k in FIELDS}, "satno": sn, "found": 0})
+                    w.writerow({"satno": sn, "found": 0})
             fh.flush()
             os.fsync(fh.fileno())                 # incremental durability
             time.sleep(args.sleep)
@@ -305,24 +300,18 @@ def main():
 def summarize(path):
     cache = load_cache(path)          # deduplicated: last row per satno wins
     n = len(cache)
-    found = withmass = withxsect = 0
-    for row in cache.values():
-        if cell(row, "found") == "1":
-            found += 1
-            if cell(row, "mass_kg"):
-                withmass += 1
-            if cell(row, "xSectAvg_m2"):
-                withxsect += 1
+    found     = sum(cell(r, "found") == "1" for r in cache.values())
+    withmass  = sum(cell(r, "found") == "1" and bool(cell(r, "mass_kg"))
+                    for r in cache.values())
+    withxsect = sum(cell(r, "found") == "1" and bool(cell(r, "xSectAvg_m2"))
+                    for r in cache.values())
+    pct = lambda a: f"{100*a/n:.1f}%" if n else "0%"
     print("\n=== DISCOS pull summary ===")
     print(f"  cached SATNOs        : {n}")
-    print(f"  found in DISCOS      : {found} ({pct(found,n)})")
-    print(f"  ...with a mass value : {withmass} ({pct(withmass,n)})  <- usable for sizing")
-    print(f"  ...with a xSect value: {withxsect} ({pct(withxsect,n)})")
-    print(f"  missing / no mass    : {n - withmass} ({pct(n-withmass,n)})  <- need fallback rule")
-
-
-def pct(a, b):
-    return f"{100*a/b:.1f}%" if b else "0%"
+    print(f"  found in DISCOS      : {found} ({pct(found)})")
+    print(f"  ...with a mass value : {withmass} ({pct(withmass)})")
+    print(f"  ...with a xSect value: {withxsect} ({pct(withxsect)})")
+    print(f"  missing / no mass    : {n - withmass} ({pct(n - withmass)})")
 
 
 if __name__ == "__main__":
